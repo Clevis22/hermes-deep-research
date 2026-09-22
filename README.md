@@ -1,9 +1,10 @@
 # hermes-deep-research
 
-One query, fanned across **91 configured sources in 10 lanes** in parallel,
+One query, routed across **91 configured sources in 10 lanes** in parallel,
 merged, deduplicated and grouped — with per-source coverage accounting, so a
 source that failed is reported as a gap rather than as "no results". **89 work
-without credentials**; GitHub code search and Bluesky are optional.
+without credentials**; GitHub code search and Bluesky are optional. An optional
+Jev decision-model router can choose relevant lanes before the fan-out.
 
 Built as a [Hermes Agent](https://github.com/NousResearch/hermes-agent) skill,
 but `scripts/deep_research.py` is **stdlib-only Python 3** and runs standalone.
@@ -15,14 +16,17 @@ or a threat assessment you need the primary sources: the CVE record, the vendor
 advisory that says whether a fix shipped, the paper, the exploit, the filing, the
 patent. This runs ~90 of those at once and tells you which ones stayed silent.
 
-The core sweep needs no API key. Two sources are optional and credentialed (see
-[Optional credentials](#optional-credentials)); without them, those sources are
-reported as not applicable rather than as failures.
+The core sweep needs no API key. Two sources and the Jev router accept optional
+credentials (see [Optional credentials](#optional-credentials)); without them,
+the sources are reported as not applicable and `--auto` uses conservative local
+rules instead.
 
 ## Quick start
 
 ```bash
 python3 scripts/deep_research.py "residential proxy networks" --deep
+python3 scripts/deep_research.py "residential proxy networks" --auto
+python3 scripts/deep_research.py "residential proxy networks" --auto --plan
 python3 scripts/deep_research.py "CVE-2021-44228" --deep
 python3 scripts/deep_research.py "CWE-89 SQL injection" --lanes security
 python3 scripts/deep_research.py "topic" --quick          # 50 keyless + optional Bluesky
@@ -64,13 +68,24 @@ CAPEC patterns for an explicit `CWE-<n>` (the two ID namespaces are never
 assumed to match); domain APIs need a domain; package APIs answer single tokens.
 Misfits are reported as "not applicable" instead of failing.
 
+**Automatic routing is hybrid, not model-only.** `--auto` always runs a small
+web discovery baseline. Exact CVE/CWE, domain, URL, IP, ASN, hash, DOI, arXiv,
+NCT, patent and package shapes force their relevant lanes with local rules, so
+Jev cannot veto them; a bare exact identifier is routed locally without calling
+Jev. For ambiguous natural-language queries, Jev scores nine
+independent lane questions in one request; lanes over the probability threshold
+plus the two strongest lanes are selected. A missing key, API failure or flat
+low-confidence distribution widens to a conservative local fallback. Use
+`--auto --plan` to see the route and request count without querying research
+sources. `--deep` remains the explicit exhaustive mode.
+
 **Every run ends with a numbered Sources block** (`[n]`-citeable) containing
 on-topic rows only.
 
 ## Optional credentials
 
-Two sources work better with a credential, and both degrade cleanly without one
-(the source reports itself as *not applicable*; everything else still runs).
+Two sources work better with a credential, and `--auto` can optionally use Jev.
+All three degrade cleanly when unconfigured.
 
 Set them in `~/.hermes/.env` (mode 0600) — the script reads that file directly,
 because a shell does not inherit the variables Hermes loads into its own process:
@@ -84,7 +99,17 @@ GITHUB_TOKEN=github_pat_xxxx
 # The identifier is the HANDLE (khermes.bsky.social), never an email form.
 BSKY_HANDLE=yourhandle.bsky.social
 BSKY_APP_PASSWORD=xxxx-xxxx-xxxx-xxxx
+
+# Optional semantic lane router. The default pinned model is typesafe/jev-1.13.
+OPENROUTER_API_KEY=sk-or-v1-xxxx
+# JEV_MODEL=typesafe/jev-1.13
 ```
+
+The router sends only the research query and fixed lane questions to
+[OpenRouter](https://openrouter.ai/typesafe/jev-1.13/api). Exact identifier
+routing still happens locally. Jev is currently served through OpenRouter's
+[experimental Decisions endpoint](https://openrouter.ai/labs/jev/compile), so
+the integration is isolated and always has a rules-only fallback.
 
 `DEMO_KEY` is used for Congress.gov and openFEC — a public rate-limited
 placeholder, not a secret.
@@ -110,7 +135,10 @@ Bluesky auth can be checked on its own with `python3 scripts/bsky_probe.py`.
 |---|---|
 | `--deep` | all 10 lanes (default) |
 | `--quick` | web+academic+community+news+reference only |
+| `--auto` | deterministic exact-shape routing plus optional Jev lane scoring |
 | `--lanes a,b` | pick lanes |
+| `--plan` | print the selected route without querying research sources |
+| `--auto-threshold P` | Jev inclusion probability, 0–1 (default `0.55`) |
 | `--limit N` | rows per source (default 5) |
 | `--read N` | pull full text of the top N URLs (needs a local extractor on :3002) |
 | `--md PATH` | write a markdown report incl. a Sources block |
@@ -123,7 +151,9 @@ Bluesky auth can be checked on its own with `python3 scripts/bsky_probe.py`.
 ## Costs
 
 A warm deep run is **8–25s**. Don't use `--deep` for a one-fact lookup — that is
-roughly 90 HTTP requests for nothing; plain search is one call.
+roughly 90 HTTP requests for nothing; use `--auto`, `--quick`, or plain search.
+At OpenRouter's September 2026 Jev price of $0.042 per million input tokens, the
+current roughly 800-token routing request costs about $0.000034.
 
 ## Licence
 

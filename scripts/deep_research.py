@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Deep research fan-out across every keyless source reachable from this Pi.
+"""Route and fan out research across public sources reachable from this Pi.
 
 One query -> ~60 sources in parallel -> deduped, citable findings grouped by
 lane, with per-source coverage accounting (a source that failed is reported as
 a gap, never as "no results").
 
-Stdlib only. No API keys anywhere in this file.
+Stdlib only. Optional credentials are loaded from the environment or Hermes env file.
 
     python3 deep_research.py "residential proxy networks" --deep
+    python3 deep_research.py "residential proxy networks" --auto --plan
     python3 deep_research.py "CVE-2021-44228" --deep
     python3 deep_research.py "stegzero.com" --lanes security,archive,web
     python3 deep_research.py "topic" --read 3 --md report.md
@@ -49,6 +50,12 @@ LANES = ("web", "academic", "code", "community", "news", "regulatory",
 
 # Deep = every lane. Quick = the ones that answer most questions.
 QUICK_LANES = ("web", "academic", "community", "news", "reference")
+
+OPENROUTER_DECISIONS_URL = os.environ.get(
+    "OPENROUTER_DECISIONS_URL", "https://openrouter.ai/api/alpha/decisions"
+)
+JEV_MODEL = os.environ.get("JEV_MODEL", "typesafe/jev-1.13")
+AUTO_THRESHOLD = 0.55
 
 
 # ---------------------------------------------------------------------------
@@ -208,12 +215,295 @@ class Q:
             self.domain = raw.split("//", 1)[-1].split("/")[0]
         elif re.match(r"^[a-z0-9-]+(\.[a-z0-9-]+)+$", raw.strip(), flags=re.I):
             self.domain = raw.strip()
+        stripped = raw.strip()
+        host_value = self.domain or stripped
+        self.ipv4 = host_value if re.fullmatch(
+            r"(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}",
+            host_value,
+        ) else None
+        if self.ipv4:
+            self.domain = None
+        self.asn = stripped.upper() if re.fullmatch(r"AS\d+", stripped, re.I) else None
+        self.hash = stripped.lower() if re.fullmatch(
+            r"(?:[a-f0-9]{32}|[a-f0-9]{40}|[a-f0-9]{64})", stripped, re.I
+        ) else None
+        self.doi = next(iter(re.findall(r"\b10\.\d{4,9}/\S+", raw, re.I)), None)
+        self.arxiv = next(iter(re.findall(r"\b(?:arxiv:)?\d{4}\.\d{4,5}\b", raw, re.I)), None)
+        self.nct = next(iter(re.findall(r"\bNCT\d{8}\b", raw, re.I)), None)
+        self.patent = next(iter(re.findall(
+            r"\b(?:US|EP|WO|GB|JP|CN)\s*\d{5,}[A-Z]?\d?\b", raw, re.I
+        )), None)
         self.is_package = bool(re.match(r"^[@a-z0-9][\w.@/-]*$", raw.strip(), flags=re.I)) and " " not in raw
         # first token(s) that look like a product/vendor name for KEV-style match
         self.words = [w for w in re.split(r"\W+", re.sub(r"CVE-\d{4}-\d{4,7}", " ", raw, flags=re.I)) if len(w) > 3]
 
     def host(self):
         return self.domain or self.raw
+
+
+# ---------------------------------------------------------------------------
+# automatic lane routing
+# ---------------------------------------------------------------------------
+
+# Jev sees one state and answers these independent yes/no questions in one
+# request. Web is deliberately absent: it is the small discovery baseline for
+# every automatic run. Exact identifiers are handled by deterministic rules
+# below and cannot be vetoed by the model.
+AUTO_LANE_QUESTIONS = {
+    "academic": (
+        "Would scholarly papers, preprints, research datasets, citations, or "
+        "scientific literature materially help answer `research_query`?"
+    ),
+    "code": (
+        "Would source-code repositories, package registries, software artifacts, "
+        "container images, or model registries materially help answer `research_query`?"
+    ),
+    "community": (
+        "Would forums, technical Q&A, social posts, or first-hand community "
+        "discussion materially help answer `research_query`?"
+    ),
+    "news": (
+        "Would current or recent journalism, announcements, or news reporting "
+        "materially help answer `research_query`?"
+    ),
+    "regulatory": (
+        "Would laws, government records, corporate filings, court opinions, "
+        "legislation, campaign data, or clinical-trial records materially help "
+        "answer `research_query`?"
+    ),
+    "security": (
+        "Would vulnerability, exploit, malware, threat-intelligence, defensive-rule, "
+        "certificate, domain, IP, or network-security sources materially help answer "
+        "`research_query`?"
+    ),
+    "reference": (
+        "Would encyclopedic, bibliographic, geographic, catalogue, linked-data, or "
+        "general reference sources materially help answer `research_query`?"
+    ),
+    "archive": (
+        "Would historical website snapshots or prior scans of a specific domain or "
+        "URL materially help answer `research_query`?"
+    ),
+    "patents": (
+        "Would patents, inventions, assignees, or prior-art records materially help "
+        "answer `research_query`?"
+    ),
+}
+
+FALLBACK_LANE_TERMS = {
+    "academic": ("paper", "study", "research", "literature", "evidence", "doi", "arxiv"),
+    "code": ("code", "github", "repository", "package", "library", "npm", "pypi", "crate", "maven"),
+    "community": ("forum", "reddit", "discussion", "community", "stackoverflow", "experience"),
+    "news": ("news", "latest", "recent", "today", "current", "announcement", "announced"),
+    "regulatory": ("law", "regulation", "regulatory", "filing", "court", "lawsuit", "bill", "clinical trial"),
+    "security": ("cve", "vulnerability", "exploit", "malware", "phishing", "breach",
+                 "threat", "attack", "proxy", "botnet", "command and control"),
+    "reference": ("what is", "who is", "where is", "definition", "overview", "history"),
+    "archive": ("archive", "archived", "historical website", "old website", "wayback"),
+    "patents": ("patent", "invention", "inventor", "prior art"),
+}
+
+
+def hard_route_lanes(q):
+    """Lanes forced by exact syntax; a statistical router cannot veto these."""
+    forced = {"web"}
+    reasons = {"web": "baseline discovery"}
+
+    if q.cves or q.cwes or q.hash or q.ipv4 or q.asn:
+        forced.add("security")
+        reasons["security"] = "exact security/network identifier"
+    if q.domain:
+        forced.update(("security", "archive", "reference"))
+        reasons.update({
+            "security": "domain or URL pivot",
+            "archive": "domain or URL history",
+            "reference": "domain or URL context",
+        })
+    if q.doi or q.arxiv:
+        forced.add("academic")
+        reasons["academic"] = "exact scholarly identifier"
+    if q.nct:
+        forced.add("regulatory")
+        reasons["regulatory"] = "clinical-trial identifier"
+    if q.patent:
+        forced.add("patents")
+        reasons["patents"] = "patent identifier"
+
+    low = q.raw.lower()
+    package_words = ("package", "npm", "pypi", "crate", "maven", "rubygems", "nuget")
+    explicit_identifier = q.doi or q.arxiv or q.nct or q.patent
+    if (not explicit_identifier and any(word in low for word in package_words)) or (
+            not explicit_identifier and q.is_package
+            and (q.raw.startswith("@") or "/" in q.raw)):
+        forced.update(("code", "security"))
+        reasons["code"] = "package-shaped query"
+        reasons.setdefault("security", "package vulnerability enrichment")
+    return forced, reasons
+
+
+def is_exact_identifier_query(q):
+    """True when local syntax supplies the complete routing decision."""
+    stripped = q.raw.strip()
+    if q.domain or q.is_url or q.ipv4 or q.asn or q.hash:
+        return True
+    exact_patterns = (
+        r"CVE-\d{4}-\d{4,7}",
+        r"CWE-\d{1,5}",
+        r"(?:doi:\s*)?10\.\d{4,9}/\S+",
+        r"(?:arxiv:)?\d{4}\.\d{4,5}",
+        r"NCT\d{8}",
+        r"(?:US|EP|WO|GB|JP|CN)\s*\d{5,}[A-Z]?\d?",
+    )
+    if any(re.fullmatch(pattern, stripped, re.I) for pattern in exact_patterns):
+        return True
+    return bool(q.is_package and (stripped.startswith("@") or "/" in stripped))
+
+
+def fallback_route_lanes(q):
+    """Conservative local fallback used when Jev is unavailable."""
+    forced, reasons = hard_route_lanes(q)
+    low = q.raw.lower()
+    matched = set()
+    for lane, terms in FALLBACK_LANE_TERMS.items():
+        if any(term in low for term in terms):
+            matched.add(lane)
+            reasons.setdefault(lane, "local keyword fallback")
+    if not matched and forced == {"web"}:
+        matched.update(QUICK_LANES)
+        for lane in QUICK_LANES:
+            reasons.setdefault(lane, "conservative quick-mode fallback")
+    return forced | matched, reasons
+
+
+def jev_lane_scores(q, api_key=None):
+    """Return (probabilities, metadata, error) from OpenRouter Jev."""
+    if api_key is None:
+        api_key = _dotenv_value("OPENROUTER_API_KEY")
+    if not api_key:
+        return None, {}, "OPENROUTER_API_KEY is not configured"
+
+    questions = {
+        f"lane_{lane}": {
+            "type": "noul",
+            "instructions": question,
+            "criteria": {
+                "true": "This source lane is likely to produce material evidence.",
+                "false": "This source lane is unlikely to improve the answer.",
+            },
+        }
+        for lane, question in AUTO_LANE_QUESTIONS.items()
+    }
+    payload = {
+        "model": JEV_MODEL,
+        "state": {"research_query": q.raw},
+        "questions": questions,
+    }
+    text, err = http(
+        OPENROUTER_DECISIONS_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://github.com/Clevis22/hermes-deep-research",
+            "X-OpenRouter-Title": "Hermes Deep Research Router",
+        },
+        timeout=20,
+        retries=1,
+    )
+    if err:
+        return None, {}, f"Jev routing failed: {err}"
+    body = jload(text) or {}
+    answers = body.get("answers") or {}
+    scores = {}
+    for lane in AUTO_LANE_QUESTIONS:
+        value = dig(answers, f"lane_{lane}.noul")
+        if not isinstance(value, (int, float)) or not 0 <= value <= 1:
+            return None, {}, f"Jev routing returned no valid probability for {lane}"
+        scores[lane] = round(float(value), 4)
+    return scores, {
+        "model": body.get("model") or JEV_MODEL,
+        "usage": body.get("usage") or {},
+    }, None
+
+
+def auto_route(query, threshold=AUTO_THRESHOLD, api_key=None):
+    """Choose lanes with hard identifier rules plus Jev's soft judgments."""
+    q = query if isinstance(query, Q) else Q(query)
+    forced, reasons = hard_route_lanes(q)
+    if is_exact_identifier_query(q):
+        ordered = [lane for lane in LANES if lane in forced]
+        return {
+            "mode": "auto-rules-exact",
+            "selected_lanes": ordered,
+            "forced_lanes": ordered,
+            "reasons": {lane: reasons[lane] for lane in ordered},
+            "probabilities": {},
+            "threshold": threshold,
+            "fallback": False,
+            "note": "exact identifier routed locally; Jev was not called",
+            "model": None,
+            "usage": {},
+        }
+    scores, meta, err = jev_lane_scores(q, api_key=api_key)
+    fallback = scores is None
+    note = err
+
+    if fallback:
+        selected, fallback_reasons = fallback_route_lanes(q)
+        reasons.update(fallback_reasons)
+        mode = "auto-rules-fallback"
+        scores = {}
+    else:
+        selected = set(forced)
+        for lane, probability in scores.items():
+            if probability >= threshold:
+                selected.add(lane)
+                reasons.setdefault(lane, f"Jev probability {probability:.2f}")
+
+        # Natural-language queries get the two strongest semantic lanes even
+        # when they sit just below the threshold. Exact identifiers already
+        # have high-recall forced routes and do not need this widening.
+        if forced == {"web"}:
+            for lane, probability in sorted(scores.items(), key=lambda item: item[1], reverse=True)[:2]:
+                selected.add(lane)
+                reasons.setdefault(lane, f"top Jev probability {probability:.2f}")
+
+        # A flat distribution near 0.5 means the router is unsure. Widen to the
+        # existing quick set instead of silently dropping a useful lane.
+        if scores and all(abs(probability - 0.5) < 0.12 for probability in scores.values()):
+            selected.update(QUICK_LANES)
+            for lane in QUICK_LANES:
+                reasons.setdefault(lane, "low-confidence quick-mode widening")
+            fallback = True
+            note = "Jev probabilities were uniformly uncertain; widened to quick lanes"
+        mode = "auto-jev"
+
+    ordered = [lane for lane in LANES if lane in selected]
+    return {
+        "mode": mode,
+        "selected_lanes": ordered,
+        "forced_lanes": [lane for lane in LANES if lane in forced],
+        "reasons": {lane: reasons[lane] for lane in ordered if lane in reasons},
+        "probabilities": scores,
+        "threshold": threshold,
+        "fallback": fallback,
+        "note": note,
+        "model": meta.get("model"),
+        "usage": meta.get("usage", {}),
+    }
+
+
+def format_route(route):
+    """Human-readable, stable route explanation for reports and --plan."""
+    lanes = ", ".join(route.get("selected_lanes") or [])
+    text = [f"route: {route.get('mode')} -> {lanes or '(none)'}"]
+    probabilities = route.get("probabilities") or {}
+    if probabilities:
+        ranked = sorted(probabilities.items(), key=lambda item: item[1], reverse=True)
+        text.append("Jev: " + ", ".join(f"{lane}={value:.2f}" for lane, value in ranked))
+    if route.get("note"):
+        text.append(f"note: {route['note']}")
+    return "\n".join(text)
 
 
 # ---------------------------------------------------------------------------
@@ -891,11 +1181,30 @@ register("AlienVault OTX", "security",
                                     f"malware={len(dig(jload(t), 'malware', []) or [])}", 100), u)], None),
          timeout=25)
 
-register("OpenPhish feed", "security",
-         lambda q: "https://openphish.com/feed.txt",
-         "text",
-         lambda t, u, q, l: ([(f"OpenPhish: {len(t.splitlines())} live phishing URLs",
-                               clip(" ".join(t.splitlines()[:3]), 140), u)], None))
+def _openphish_build(q):
+    """The bulk feed is useful only when there is a concrete domain to match."""
+    return "https://openphish.com/feed.txt" if q.domain else None
+
+
+def _openphish_parse(text, _url, q, limit):
+    rows = []
+    target = (q.domain or "").lower().rstrip(".")
+    for candidate in text.splitlines():
+        candidate = candidate.strip()
+        if not candidate:
+            continue
+        try:
+            hostname = (urllib.parse.urlparse(candidate).hostname or "").lower().rstrip(".")
+        except ValueError:
+            continue
+        if target and (hostname == target or hostname.endswith(f".{target}")):
+            rows.append((f"OpenPhish match for {target}", hostname, candidate))
+            if len(rows) >= limit:
+                break
+    return rows, None
+
+
+register("OpenPhish feed", "security", _openphish_build, "text", _openphish_parse)
 
 register("ExploitDB", "security",
          lambda q: "https://gitlab.com/exploit-database/exploitdb/-/raw/main/files_exploits.csv",
@@ -1366,7 +1675,20 @@ def research(query, lanes=None, limit=5, workers=8, on_progress=None):
             continue
         by_lane.setdefault(r.lane, []).append(r)
     return {
-        "query": query, "shape": {"cve": q.cves, "domain": q.domain, "url": q.is_url},
+        "query": query,
+        "shape": {
+            "cve": q.cves,
+            "cwe": q.cwes,
+            "domain": q.domain,
+            "url": q.is_url,
+            "ip": q.ipv4,
+            "asn": q.asn,
+            "hash": q.hash,
+            "doi": q.doi,
+            "arxiv": q.arxiv,
+            "nct": q.nct,
+            "patent": q.patent,
+        },
         "elapsed_s": round(time.time() - t0, 1),
         "sources_queried": len(chosen),
         "sources_with_hits": len({source for r in unique if not r.off_topic
@@ -1453,7 +1775,7 @@ def compact_payload(res, max_sources=0):
     sources = [(t, u, s) for t, u, s in collect_sources(res)]
     shown = sources[:max_sources] if max_sources else sources
 
-    return {
+    payload = {
         "query": res["query"],
         "shape": res["shape"],
         "lanes": res["lanes"],
@@ -1475,6 +1797,9 @@ def compact_payload(res, max_sources=0):
         "empty_sources": res["empty_sources"],
         "skipped_not_applicable": res["skipped_not_applicable"],
     }
+    if res.get("routing"):
+        payload["routing"] = res["routing"]
+    return payload
 
 
 def to_lanes(payload):
@@ -1497,6 +1822,8 @@ def render_payload(payload, show_unrelated=True):
                  f"URLs only in the JSON, not listed here)")
     shape = ", ".join(f"{k}={v}" for k, v in payload["shape"].items() if v)
     L.append(f"query shape: {shape or 'free text'}")
+    if payload.get("routing"):
+        L.extend(format_route(payload["routing"]).splitlines())
     L.append("")
     lanes = to_lanes(payload)
     for lane in LANES:
@@ -1562,6 +1889,8 @@ def text_report(res, show_errors=True, show_unrelated=False):
                  f"kept in the JSON, listed under 'Unrelated matches' at the end)")
     shape = ", ".join(f"{k}={v}" for k, v in res["shape"].items() if v)
     L.append(f"query shape: {shape or 'free text'}")
+    if res.get("routing"):
+        L.extend(format_route(res["routing"]).splitlines())
     L.append("")
     for lane in LANES:
         rows = res["by_lane"].get(lane)
@@ -1667,7 +1996,13 @@ def main():
     ap.add_argument("query", nargs="?")
     ap.add_argument("--deep", action="store_true", help="all lanes (default)")
     ap.add_argument("--quick", action="store_true", help="web+academic+community+news+reference")
+    ap.add_argument("--auto", action="store_true",
+                    help="route exact shapes locally and natural-language intent with Jev")
     ap.add_argument("--lanes", help="comma-separated: " + ",".join(LANES))
+    ap.add_argument("--plan", action="store_true",
+                    help="print the routing plan without querying research sources")
+    ap.add_argument("--auto-threshold", type=float, default=AUTO_THRESHOLD, metavar="P",
+                    help=f"Jev lane probability threshold (default {AUTO_THRESHOLD})")
     ap.add_argument("--limit", type=int, default=5, help="rows per source (default 5)")
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--read", type=int, default=0, metavar="N",
@@ -1728,12 +2063,50 @@ def main():
         print("\nSources available: run with --sources")
         return 2
 
-    lanes = QUICK_LANES if args.quick else (tuple(l.strip() for l in args.lanes.split(",") if l.strip())
-                                            if args.lanes else LANES)
+    if sum(bool(value) for value in (args.auto, args.quick, args.deep, args.lanes)) > 1:
+        print("choose only one of --auto, --quick, --deep, or --lanes", file=sys.stderr)
+        return 2
+    if not 0 <= args.auto_threshold <= 1:
+        print("--auto-threshold must be between 0 and 1", file=sys.stderr)
+        return 2
+
+    if args.auto:
+        routing = auto_route(args.query, threshold=args.auto_threshold)
+        lanes = tuple(routing["selected_lanes"])
+    elif args.quick:
+        lanes = QUICK_LANES
+        routing = {
+            "mode": "quick", "selected_lanes": list(lanes), "forced_lanes": [],
+            "reasons": {}, "probabilities": {}, "fallback": False, "note": None,
+        }
+    elif args.lanes:
+        lanes = tuple(l.strip() for l in args.lanes.split(",") if l.strip())
+        routing = {
+            "mode": "manual", "selected_lanes": list(lanes), "forced_lanes": [],
+            "reasons": {}, "probabilities": {}, "fallback": False, "note": None,
+        }
+    else:
+        lanes = LANES
+        routing = {
+            "mode": "deep", "selected_lanes": list(lanes), "forced_lanes": [],
+            "reasons": {}, "probabilities": {}, "fallback": False, "note": None,
+        }
     bad = [l for l in lanes if l not in LANES]
     if bad:
         print(f"unknown lane(s): {', '.join(bad)}. available: {', '.join(LANES)}", file=sys.stderr)
         return 2
+
+    if args.plan:
+        chosen = [source for source in S if source["lane"] in set(lanes)]
+        print(f"# Research route: {args.query}\n")
+        print(format_route(routing))
+        print(f"configured sources in selected lanes: {len(chosen)} of {len(S)}")
+        if routing.get("reasons"):
+            print("reasons:")
+            for lane in lanes:
+                if lane in routing["reasons"]:
+                    print(f"  - {lane}: {routing['reasons'][lane]}")
+        return 0
 
     def prog(done, total, name, n):
         if args.live:
@@ -1741,6 +2114,7 @@ def main():
 
     res = research(args.query, lanes=lanes, limit=args.limit,
                    workers=args.workers, on_progress=prog)
+    res["routing"] = routing
 
     if args.read:
         read_targets = [r.url for r in res["findings"] if r.url][: args.read]

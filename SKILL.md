@@ -1,7 +1,7 @@
 ---
 name: deep-research
 description: "Use when the user asks for deep research or a multi-source sweep. Fans one query across 91 configured sources; 89 are keyless."
-version: 1.4.0
+version: 1.5.0
 author: Hermes Agent
 license: MIT
 platforms: [linux]
@@ -17,7 +17,8 @@ Trigger: **"deep research X"**, "research X thoroughly", "sweep the literature o
 X", "what's the evidence for X". One command fans the query across **91
 configured sources in 10 lanes**, in parallel, merged and grouped, with
 per-source coverage accounting. **89 are keyless**; GitHub code search and
-Bluesky are optional credentialed sources.
+Bluesky are optional credentialed sources. `--auto` can use Jev to select
+relevant lanes while deterministic rules protect exact identifiers.
 
 ## When to use
 
@@ -39,6 +40,8 @@ Use plain `web_search` — it is one call instead of roughly 90.
 S=~/.hermes/skills/research/deep-research/scripts/deep_research.py
 
 python3 "$S" "residential proxy networks" --deep                 # all 91 configured sources
+python3 "$S" "residential proxy networks" --auto                 # relevant lanes only
+python3 "$S" "residential proxy networks" --auto --plan          # explain; no source calls
 python3 "$S" "residential proxy networks" --deep --read 3 --md ~/dr.md
 python3 "$S" "topic" --quick                                     # 50 keyless + optional Bluesky
 python3 "$S" "log4j" --lanes academic,community,security
@@ -54,7 +57,10 @@ python3 "$S" --sources                                           # list the regi
 |---|---|
 | `--deep` | all 10 lanes (default) |
 | `--quick` | web+academic+community+news+reference only |
+| `--auto` | exact-shape rules + optional Jev semantic lane routing |
 | `--lanes a,b` | pick lanes: `web academic code community news regulatory security reference archive patents` |
+| `--plan` | print the route without querying research sources |
+| `--auto-threshold P` | Jev lane probability threshold (default `0.55`) |
 | `--limit N` | rows per source (default 5) |
 | `--read N` | also pull full text of the top N URLs via local PiExtract |
 | `--md PATH` | write a markdown report incl. a Sources block |
@@ -108,6 +114,16 @@ Bluesky's public AppView 403s
 credential lives in `~/.hermes/.env` as `BSKY_HANDLE` + `BSKY_APP_PASSWORD`
 (an app password, **not** the account password) and is read directly from that
 file, because the shell that runs this script does not inherit Hermes' env.
+
+**Jev routing is optional.** Put `OPENROUTER_API_KEY` in `~/.hermes/.env` to
+enable semantic lane scoring for `--auto`. The pinned default is
+`typesafe/jev-1.13`; override it with `JEV_MODEL` only after re-running the
+routing tests. Exact CVE/CWE, domain, URL, IP, ASN, hash, DOI, arXiv, NCT,
+patent and explicit package shapes are routed locally and cannot be vetoed by
+Jev; a bare exact identifier does not call Jev at all. If the key is absent,
+the Decisions endpoint fails, or the probabilities are uniformly uncertain,
+the command widens to a conservative local fallback. Use `--auto --plan` to
+audit the selected lanes before a live sweep.
 
 Two traps, both of which silently cost a whole session:
 
@@ -241,9 +257,9 @@ which is what removed the repeated Crossref/Google-Scholar pairs.
   assistant text in the reply. Writing it to a `--md` file only, or leaving it in the
   ledger, counts as *not* delivering it. Do this every time the research skill runs, even
   when the answer already has inline `[n]` citations.
-- **`--deep` on every question is waste.** 72 sources for "what time is the
-  game" is 8s and 72 HTTP requests for nothing. Use `--quick` unless the ask is
-  genuinely a research task.
+- **`--deep` on every question is waste.** A simple lookup should use `--auto`,
+  `--quick`, or plain web search. Reserve `--deep` for a genuinely exhaustive
+  sweep.
 - **SearXNG `scientific publications` is the load-bearing source.** It reaches
   Google Scholar and Semantic Scholar, which no standalone keyless API here can.
   Omitting it once cost the NDSS residential-proxy-detection paper entirely. Its

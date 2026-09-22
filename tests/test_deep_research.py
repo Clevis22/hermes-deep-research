@@ -19,8 +19,110 @@ class QueryShapeTests(unittest.TestCase):
         self.assertEqual(query.cves, ["CVE-2021-44228"])
         self.assertEqual(query.cwes, [])
 
+    def test_ipv4_is_not_treated_as_a_domain(self):
+        query = deep_research.Q("1.1.1.1")
+        self.assertEqual(query.ipv4, "1.1.1.1")
+        self.assertIsNone(query.domain)
+
+
+class AutoRoutingTests(unittest.TestCase):
+    @staticmethod
+    def jev_response(**scores):
+        answers = {
+            f"lane_{lane}": {"type": "noul", "noul": scores.get(lane, 0.05)}
+            for lane in deep_research.AUTO_LANE_QUESTIONS
+        }
+        return json.dumps({
+            "model": "typesafe/jev-1.13-test",
+            "answers": answers,
+            "usage": {"input_tokens": 321, "output_tokens": 18},
+        })
+
+    def test_jev_routes_ambiguous_query_to_top_relevant_lanes(self):
+        body = self.jev_response(academic=0.94, security=0.88, news=0.31)
+        with mock.patch.object(deep_research, "http", return_value=(body, None)):
+            route = deep_research.auto_route(
+                "residential proxy detection research", api_key="test-key"
+            )
+
+        self.assertEqual(route["mode"], "auto-jev")
+        self.assertEqual(route["selected_lanes"], ["web", "academic", "security"])
+        self.assertEqual(route["probabilities"]["academic"], 0.94)
+        self.assertFalse(route["fallback"])
+
+    def test_exact_cve_forces_security_even_when_jev_says_no(self):
+        with mock.patch.object(deep_research, "http") as mocked_http:
+            route = deep_research.auto_route("CVE-2021-44228", api_key="test-key")
+
+        mocked_http.assert_not_called()
+        self.assertEqual(route["mode"], "auto-rules-exact")
+        self.assertIn("security", route["selected_lanes"])
+        self.assertIn("security", route["forced_lanes"])
+        self.assertEqual(route["reasons"]["security"], "exact security/network identifier")
+
+    def test_exact_doi_forces_academic_without_package_lanes(self):
+        route = deep_research.auto_route("10.1234/example", api_key="test-key")
+
+        self.assertEqual(route["selected_lanes"], ["web", "academic"])
+        self.assertNotIn("code", route["selected_lanes"])
+        self.assertNotIn("security", route["selected_lanes"])
+
+    def test_missing_key_uses_conservative_local_fallback(self):
+        route = deep_research.auto_route("latest court ruling", api_key="")
+
+        self.assertEqual(route["mode"], "auto-rules-fallback")
+        self.assertTrue(route["fallback"])
+        self.assertIn("news", route["selected_lanes"])
+        self.assertIn("regulatory", route["selected_lanes"])
+        self.assertIn("OPENROUTER_API_KEY", route["note"])
+
+    def test_local_fallback_keeps_security_for_proxy_research(self):
+        route = deep_research.auto_route(
+            "residential proxy detection research", api_key=""
+        )
+
+        self.assertIn("academic", route["selected_lanes"])
+        self.assertIn("security", route["selected_lanes"])
+
+    def test_jev_payload_batches_all_lane_questions(self):
+        body = self.jev_response(reference=0.9, news=0.8)
+        captured = {}
+
+        def fake_http(url, **kwargs):
+            captured["url"] = url
+            captured["payload"] = json.loads(kwargs["data"])
+            return body, None
+
+        with mock.patch.object(deep_research, "http", side_effect=fake_http):
+            deep_research.jev_lane_scores(deep_research.Q("OpenAI history"), api_key="secret")
+
+        self.assertEqual(captured["url"], deep_research.OPENROUTER_DECISIONS_URL)
+        self.assertEqual(captured["payload"]["model"], deep_research.JEV_MODEL)
+        self.assertEqual(
+            set(captured["payload"]["questions"]),
+            {f"lane_{lane}" for lane in deep_research.AUTO_LANE_QUESTIONS},
+        )
+
 
 class ParserTests(unittest.TestCase):
+    def test_openphish_only_returns_target_domain_matches(self):
+        query = deep_research.Q("example.com")
+        feed = "\n".join([
+            "https://unrelated.test/login",
+            "https://example.com/account",
+            "https://secure.example.com/auth",
+            "not a URL",
+        ])
+
+        rows, note = deep_research._openphish_parse(
+            feed, "https://openphish.com/feed.txt", query, 10
+        )
+
+        self.assertIsNone(note)
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all("example.com" in row[2] for row in rows))
+        self.assertIsNone(deep_research._openphish_build(deep_research.Q("CVE-2021-44228")))
+
     def test_capec_uses_mitre_relationships_not_matching_numeric_ids(self):
         payload = {
             "Weaknesses": [{
