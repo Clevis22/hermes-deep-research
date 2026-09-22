@@ -59,10 +59,12 @@ loads automatically.
 its error. A gap is *not* evidence of absence — that distinction is the whole
 point when you are about to cite something.
 
-**Cross-source duplicates are corroboration.** Rows describing the same item
-(same normalized title or URL) merge into one finding naming every source that
-carried it. A CVE found by both NVD and CISA KEV becomes one line reading
-`sources: NVD, CISA KEV`.
+**Adapter count is not corroboration.** Rows describing the same item merge into
+one finding, but the evidence ledger separately counts adapters and independent
+publisher/service origins. Two search engines pointing to the same article are
+`rediscovered-single-origin`; distinct origins are
+`independently-corroborated`. Structured registry/API records are labeled without
+pretending that any of these states is a factual truth score.
 
 **Query shapes are respected.** CVE-id APIs are only queried when the query
 contains a `CVE-…`; exact `ecosystem:package@version` and hosted-repository
@@ -151,11 +153,21 @@ Bluesky auth can be checked on its own with `python3 scripts/bsky_probe.py`.
 | `--limit N` | rows per source (default 5) |
 | `--read N` | pull full text of the top N URLs (needs a local extractor on :3002) |
 | `--md PATH` | write a markdown report incl. a Sources block |
+| `--ledger PATH` | write the auditable evidence ledger as JSON |
 | `--json [full\|compact]` | machine output; `compact` drops redundant fields |
 | `--render PATH` | render a JSON run as text without re-searching |
 | `--max-sources N` | cap the stdout Sources list (default 30; `0` = all) |
 | `--live` | stream per-source progress to stderr |
 | `--workers N` | concurrency (default 8) |
+
+## Evidence ledger
+
+Every on-topic finding receives a stable ID, a provenance role, its contributing
+adapters, and a conservative count of independent publisher/service origins.
+Reports show the compact status; `--ledger PATH` writes the complete support
+records. The ledger deliberately does not assign a truth probability or claim
+that contradictions were checked from titles alone. See
+[the evidence-ledger schema](references/evidence-ledger.md).
 
 ## Costs
 

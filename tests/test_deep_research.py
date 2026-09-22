@@ -327,6 +327,48 @@ class AccountingTests(unittest.TestCase):
         self.assertEqual(result["sources_with_hits"], 2)
         self.assertEqual(result["unrelated_matches"], 0)
         self.assertEqual(set(result["findings"][0].sources), {"First", "Second"})
+        self.assertEqual(
+            result["evidence_ledger"][0]["status"],
+            "rediscovered-single-origin",
+        )
+        self.assertEqual(result["evidence_ledger"][0]["independent_origins"], 1)
+
+
+class EvidenceLedgerTests(unittest.TestCase):
+    def test_distinct_publishers_are_independent_corroboration(self):
+        result = deep_research.Result(
+            "Adapter A", "web", "Same finding", "", "https://alpha.example/item"
+        )
+        other = deep_research.Result(
+            "Adapter B", "news", "Same finding", "", "https://bravo.test/report"
+        )
+        result.sources.extend(other.sources)
+        result.evidence.extend(other.evidence)
+
+        entry = deep_research.finalize_evidence(result)
+
+        self.assertEqual(entry["status"], "independently-corroborated")
+        self.assertEqual(entry["independent_origins"], 2)
+        self.assertEqual(entry["contradiction_assessment"],
+                         "not-assessed-without-full-text")
+
+    def test_structured_record_is_not_mislabeled_as_corroborated(self):
+        result = deep_research.Result(
+            "NVD", "security", "CVE record", "", "https://nvd.nist.gov/vuln/1"
+        )
+
+        entry = deep_research.finalize_evidence(result)
+
+        self.assertEqual(entry["status"], "structured-record")
+        self.assertEqual(entry["adapter_count"], 1)
+
+    def test_ledger_payload_states_limitations(self):
+        payload = deep_research.evidence_ledger_payload({
+            "query": "example", "evidence_summary": {}, "evidence_ledger": [],
+        })
+
+        self.assertEqual(payload["schema"], "hermes-evidence-ledger/v1")
+        self.assertTrue(any("not proof" in item for item in payload["limitations"]))
 
 
 class ReportingTests(unittest.TestCase):

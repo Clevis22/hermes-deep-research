@@ -1,7 +1,7 @@
 ---
 name: deep-research
 description: "Use when the user asks for deep research or a multi-source sweep. Routes one query across 101 configured sources; 99 are keyless."
-version: 1.6.0
+version: 1.7.0
 author: Hermes Agent
 license: MIT
 platforms: [linux]
@@ -50,6 +50,7 @@ python3 "$S" "CWE-89" --lanes security                           # CWE/CAPEC sha
 python3 "$S" "residential proxy" --lanes patents                 # Google Patents
 python3 "$S" "stegzero.com" --lanes archive,security,reference   # domain shape
 python3 "$S" "topic" --deep --json > evidence.json
+python3 "$S" "topic" --auto --ledger ledger.json
 python3 "$S" --sources                                           # list the registry
 ```
 
@@ -64,6 +65,7 @@ python3 "$S" --sources                                           # list the regi
 | `--limit N` | rows per source (default 5) |
 | `--read N` | also pull full text of the top N URLs via local PiExtract |
 | `--md PATH` | write a markdown report incl. a Sources block |
+| `--ledger PATH` | write the full evidence/provenance ledger as JSON |
 | `--json [full\|compact]` | machine output. `compact` is the analysis form — see below |
 | `--render PATH` | render a JSON run as text (no searching; rebuilds the lane view) |
 | `--no-unrelated` | omit the unrelated-matches section |
@@ -243,16 +245,20 @@ The report separates four things — do not collapse them:
 Reporting rule: say which lanes were quiet. An empty `security` lane on a
 free-text query is expected; an empty `academic` lane is a finding.
 
-## Merging and corroboration (why one finding can name several sources)
+## Merging and evidence independence
 
 Rows that describe the same item — same normalized title, or same normalized URL
-— are **merged into one finding that lists every source which carried it**.
-A paper found by both Crossref and Google Scholar becomes one line reading
-`sources: SearXNG science, Crossref`. 45 of 63 findings in the control run are
-multi-source, which is corroboration made visible rather than duplicate lines.
+— are **merged into one finding that lists every adapter which carried it**.
+Adapter count is not evidence independence: two search adapters pointing to one
+publisher are labeled `rediscovered-single-origin`. Only distinct conservative
+publisher/service origins are labeled `independently-corroborated`; a structured
+registry/API record can instead be `structured-record`.
 
 The merge is a *display* choice, not evidence-gathering: nothing is discarded,
-and the JSON carries the full `sources` list per finding.
+and full JSON carries each support record. `--ledger PATH` writes the portable
+`hermes-evidence-ledger/v1` artifact. Read
+[references/evidence-ledger.md](references/evidence-ledger.md) when consuming or
+changing that schema.
 
 Aggregator rows from one source are collapsed inside that source before merging,
 which is what removed the repeated Crossref/Google-Scholar pairs.
@@ -274,9 +280,9 @@ which is what removed the repeated Crossref/Google-Scholar pairs.
   Omitting it once cost the NDSS residential-proxy-detection paper entirely. Its
   results arrive ordered by position, and relevant papers can sit ~11 deep, so
   SearXNG sources are read with `limit_multiplier=5` (5 × `--limit` rows).
-- **Cross-source duplicates are corroboration, not noise.** Rows with the same
-  normalized title or URL merge, but every contributing source remains in the
-  finding's `sources` list and in `sources_with_hits` accounting.
+- **Adapter duplication is not independent corroboration.** Rows with the same
+  normalized title or URL merge, every adapter remains visible, and the ledger
+  separately counts conservative publisher/service origins.
 - **NVD `keywordSearch` matches CVE text, not nicknames** — `log4shell` → 0,
   `log4j` → 34. Pass the CVE id and the script does an exact `cveId=` lookup.
 - **CISA KEV matches vendor/product text**, substring-wise. CVE ids are stripped

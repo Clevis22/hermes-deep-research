@@ -25,6 +25,7 @@ echo "=== positive control: residential proxy networks ==="
 python3 "$S" "residential proxy networks" --deep --limit 5 --no-unrelated > /tmp/v_pos.txt 2>/tmp/v_pos_err.txt
 grep -q '^## NEWS' /tmp/v_pos.txt; chkc "NEWS section present (RSS not regressed)" $?
 grep -q '^## ACADEMIC' /tmp/v_pos.txt; chkc "ACADEMIC section present" $?
+grep -q '^evidence: ' /tmp/v_pos.txt; chkc "evidence-independence summary present" $?
 [ "$(grep -c '^## Sources (' /tmp/v_pos.txt)" = "1" ]; chkc "exactly one Sources header" $?
 [ "$(sed -n '/^## Sources (/,$p' /tmp/v_pos.txt | grep -ci 'painting')" = "0" ]; chkc "off-topic rows excluded from Sources" $?
 [ "$(sed -n '/^## WEB/,/^## Unrelated/p' /tmp/v_pos.txt | grep -ci 'painting')" = "0" ]; chkc "no off-topic in WEB lane" $?
@@ -85,6 +86,24 @@ import json
 d = json.load(open("/tmp/v.json"))
 print("  info: compact omits by_lane:", "by_lane" not in d, "| on_topic:", len(d.get("on_topic", [])))
 PY
+python3 - <<'PY'
+import json
+d = json.load(open("/tmp/v.json"))
+assert "evidence_summary" in d
+assert all("verification_status" in row for row in d.get("on_topic", []))
+PY
+chkc "compact JSON carries evidence status" $?
+
+echo "=== evidence ledger artifact ==="
+python3 "$S" "npm:express@4.18.2" --auto --limit 1 --no-sources \
+  --ledger /tmp/v_ledger.json >/tmp/v_ledger.txt 2>&1
+python3 - <<'PY'
+import json
+d = json.load(open("/tmp/v_ledger.json"))
+assert d["schema"] == "hermes-evidence-ledger/v1"
+assert "limitations" in d and "findings" in d and "summary" in d
+PY
+chkc "ledger schema and cautions present" $?
 
 echo "=== bad lane rejected ==="
 python3 "$S" "x" --lanes nope >/dev/null 2>&1; [ "$?" != "0" ]; chkc "unknown lane exits non-zero" $?

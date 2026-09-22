@@ -2024,14 +2024,173 @@ register("urlscan.io", "archive",
 # runner
 # ---------------------------------------------------------------------------
 
+# Evidence roles describe what an adapter returned; they are not truth scores.
+# In particular, two search adapters that rediscover one publisher are one
+# independent origin, not two corroborating sources.
+DISCOVERY_SOURCES = {
+    "Bing News RSS", "Google News RSS", "Yahoo News RSS",
+    "Wikipedia search", "HF Papers",
+}
+
+STRUCTURED_RECORD_SOURCES = {
+    "Crossref", "OpenAlex", "DataCite", "OpenCitations", "Unpaywall (OA PDF)",
+    "deps.dev", "Software Heritage", "SEC EDGAR full-text", "Federal Register",
+    "Congress.gov", "CourtListener", "openFEC", "ClinicalTrials.gov",
+    "CISA KEV", "NVD", "EPSS", "CIRCL CVE", "OSV", "GitHub Advisories",
+    "OpenSSF Scorecard", "CertSpotter CT", "Shodan InternetDB", "RIPEstat",
+    "AlienVault OTX", "Red Hat CVE", "Ubuntu CVE", "MITRE CAPEC", "MITRE CWE",
+    "RDAP", "PeeringDB", "GLEIF", "OFAC SDN", "OFAC Consolidated",
+    "Wayback CDX", "urlscan.io", "Google Patents",
+}
+
+_MULTIPART_PUBLIC_SUFFIXES = {
+    "co.uk", "org.uk", "gov.uk", "ac.uk", "com.au", "net.au", "org.au",
+    "co.jp", "co.nz", "com.br", "com.cn", "com.sg", "co.za",
+}
+
+
+def evidence_role(source, lane):
+    """Classify provenance without implying that the content is correct."""
+    if source.startswith("SearXNG") or source in DISCOVERY_SOURCES:
+        return "discovery"
+    if source in STRUCTURED_RECORD_SOURCES:
+        return "structured-record"
+    if lane == "academic":
+        return "scholarly"
+    if lane == "community":
+        return "community"
+    if lane == "news":
+        return "reporting"
+    if lane == "code":
+        return "software-artifact"
+    if lane == "reference":
+        return "reference"
+    return "source-record"
+
+
+def evidence_origin(url, source=""):
+    """Return a conservative publisher/service origin for independence counts."""
+    try:
+        host = (urllib.parse.urlparse(url).hostname or "").lower().strip(".")
+    except (TypeError, ValueError):
+        host = ""
+    host = re.sub(r"^(?:www\d*|api|data|search)\.", "", host)
+    parts = host.split(".") if host else []
+    if len(parts) >= 3 and ".".join(parts[-2:]) in _MULTIPART_PUBLIC_SUFFIXES:
+        host = ".".join(parts[-3:])
+    elif len(parts) >= 2:
+        host = ".".join(parts[-2:])
+    # A source label is safer than treating every missing URL as the same origin.
+    return host or f"adapter:{source.lower()}"
+
+
+def evidence_item(source, lane, title, meta, url):
+    return {
+        "source": source,
+        "role": evidence_role(source, lane),
+        "origin": evidence_origin(url, source),
+        "url": url,
+        "title": title,
+        "meta": meta,
+    }
+
+
+def finalize_evidence(result):
+    """Attach conservative independence metrics and return a ledger entry."""
+    records = result.evidence
+    origins = sorted({item["origin"] for item in records if item.get("origin")})
+    adapters = sorted({item["source"] for item in records if item.get("source")})
+    roles = sorted({item["role"] for item in records if item.get("role")})
+    if len(origins) >= 2:
+        status = "independently-corroborated"
+    elif "structured-record" in roles:
+        status = "structured-record"
+    elif len(adapters) >= 2:
+        status = "rediscovered-single-origin"
+    else:
+        status = "single-origin"
+    stable = "|".join((result.title.lower(), *origins))
+    result.finding_id = "f-" + hashlib.sha256(stable.encode("utf-8")).hexdigest()[:12]
+    result.verification_status = status
+    result.independent_origins = len(origins)
+    result.adapter_count = len(adapters)
+    return {
+        "id": result.finding_id,
+        "finding": result.title,
+        "lane": result.lane,
+        "status": status,
+        "independent_origins": len(origins),
+        "adapter_count": len(adapters),
+        "origins": origins,
+        "roles": roles,
+        "support": records,
+        "contradictions": [],
+        "contradiction_assessment": "not-assessed-without-full-text",
+    }
+
+
+def summarize_evidence(ledger):
+    statuses = {
+        "independently-corroborated": 0,
+        "structured-record": 0,
+        "rediscovered-single-origin": 0,
+        "single-origin": 0,
+    }
+    for entry in ledger:
+        statuses[entry["status"]] = statuses.get(entry["status"], 0) + 1
+    return {
+        "findings": len(ledger),
+        **statuses,
+        "method": "publisher-domain independence; no factual truth score",
+    }
+
+
+def format_evidence_summary(summary):
+    """One compact, explicitly non-probabilistic evidence-quality line."""
+    if not summary:
+        return None
+    return (
+        "evidence: "
+        f"{summary.get('independently-corroborated', 0)} independently corroborated · "
+        f"{summary.get('structured-record', 0)} structured records · "
+        f"{summary.get('rediscovered-single-origin', 0)} rediscovered from one origin · "
+        f"{summary.get('single-origin', 0)} other single-origin"
+    )
+
+
+def evidence_ledger_payload(res):
+    """Portable audit artifact for a completed run."""
+    return {
+        "schema": "hermes-evidence-ledger/v1",
+        "query": res["query"],
+        "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "routing": res.get("routing"),
+        "summary": res.get("evidence_summary", {}),
+        "findings": res.get("evidence_ledger", []),
+        "limitations": [
+            "A distinct publisher or service origin is a provenance signal, not proof.",
+            "Adapter rediscovery of one origin is not independent corroboration.",
+            "Contradictions are not assessed unless full text is separately reviewed.",
+        ],
+    }
+
 class Result:
-    __slots__ = ("source", "lane", "title", "meta", "url", "error", "off_topic", "sources")
+    __slots__ = (
+        "source", "lane", "title", "meta", "url", "error", "off_topic", "sources",
+        "evidence", "finding_id", "verification_status", "independent_origins",
+        "adapter_count",
+    )
 
     def __init__(self, source, lane, title, meta, url, error=None, off_topic=False):
         self.source, self.lane = source, lane
         self.title, self.meta, self.url, self.error = title, meta, url, error
         self.off_topic = off_topic
         self.sources = [source] if source else []
+        self.evidence = [evidence_item(source, lane, title, meta, url)] if source else []
+        self.finding_id = None
+        self.verification_status = "unassessed"
+        self.independent_origins = 0
+        self.adapter_count = len(self.sources)
 
     def as_dict(self):
         """__slots__ means vars() does not work — serialize explicitly."""
@@ -2202,6 +2361,15 @@ def research(query, lanes=None, limit=5, workers=8, on_progress=None):
             for s in r.sources:
                 if s not in hit.sources:
                     hit.sources.append(s)
+            known_evidence = {
+                (item.get("source"), norm_url(item.get("url")))
+                for item in hit.evidence
+            }
+            for item in r.evidence:
+                key = (item.get("source"), norm_url(item.get("url")))
+                if key not in known_evidence:
+                    hit.evidence.append(item)
+                    known_evidence.add(key)
             if not hit.meta and r.meta:
                 hit.meta = r.meta
             # A duplicate is on-topic if any source supplied an on-topic form.
@@ -2213,10 +2381,13 @@ def research(query, lanes=None, limit=5, workers=8, on_progress=None):
     unique = merged
     by_lane = {}
     unrelated = 0
+    evidence_ledger = []
     for r in unique:
+        ledger_entry = finalize_evidence(r)
         if r.off_topic:
             unrelated += 1
             continue
+        evidence_ledger.append(ledger_entry)
         by_lane.setdefault(r.lane, []).append(r)
     return {
         "query": query,
@@ -2245,6 +2416,8 @@ def research(query, lanes=None, limit=5, workers=8, on_progress=None):
         "unrelated_matches": unrelated,
         "empty_sources": empty, "skipped_not_applicable": skipped,
         "duplicates_collapsed": dupes, "lanes": sorted(wanted),
+        "evidence_ledger": evidence_ledger,
+        "evidence_summary": summarize_evidence(evidence_ledger),
     }
 
 
@@ -2273,7 +2446,10 @@ def read_url(url, chars=4000):
 # A result row is the unit a reader quotes from. Everything else in a row is
 # provenance already visible in the `sources` list, so the trimmed form keeps
 # what is citable and drops the rest.
-_ROW_KEYS = ("lane", "title", "url", "sources")
+_ROW_KEYS = (
+    "lane", "title", "url", "sources", "finding_id", "verification_status",
+    "independent_origins", "adapter_count",
+)
 
 
 def rfield(r, name, default=None):
@@ -2344,6 +2520,7 @@ def compact_payload(res, max_sources=0):
         "gaps": res["errors"],
         "empty_sources": res["empty_sources"],
         "skipped_not_applicable": res["skipped_not_applicable"],
+        "evidence_summary": res.get("evidence_summary", {}),
     }
     if res.get("routing"):
         payload["routing"] = res["routing"]
@@ -2370,6 +2547,10 @@ def render_payload(payload, show_unrelated=True):
                  f"URLs only in the JSON, not listed here)")
     shape = ", ".join(f"{k}={v}" for k, v in payload["shape"].items() if v)
     L.append(f"query shape: {shape or 'free text'}")
+    evidence_line = format_evidence_summary(payload.get("evidence_summary"))
+    if evidence_line:
+        L.append(evidence_line)
+        L.append("evidence status measures distinct publisher/service origins, not truth")
     if payload.get("routing"):
         L.extend(format_route(payload["routing"]).splitlines())
     L.append("")
@@ -2386,6 +2567,12 @@ def render_payload(payload, show_unrelated=True):
             if r.get("url"):
                 L.append(f"  - {r['url']}")
             L.append(f"  - sources: {', '.join(r.get('sources') or [])}")
+            if r.get("verification_status"):
+                L.append(
+                    f"  - evidence: {r['verification_status']} "
+                    f"({r.get('independent_origins', 0)} origins, "
+                    f"{r.get('adapter_count', 0)} adapters)"
+                )
         L.append("")
     if payload.get("gaps"):
         L.append("## Coverage gaps and notes (a gap is not evidence of absence)")
@@ -2437,6 +2624,10 @@ def text_report(res, show_errors=True, show_unrelated=False):
                  f"kept in the JSON, listed under 'Unrelated matches' at the end)")
     shape = ", ".join(f"{k}={v}" for k, v in res["shape"].items() if v)
     L.append(f"query shape: {shape or 'free text'}")
+    evidence_line = format_evidence_summary(res.get("evidence_summary"))
+    if evidence_line:
+        L.append(evidence_line)
+        L.append("evidence status measures distinct publisher/service origins, not truth")
     if res.get("routing"):
         L.extend(format_route(res["routing"]).splitlines())
     L.append("")
@@ -2452,6 +2643,11 @@ def text_report(res, show_errors=True, show_unrelated=False):
             if r.url:
                 L.append(f"  - {r.url}")
             L.append(f"  - sources: {', '.join(r.sources)}")
+            if r.verification_status != "unassessed":
+                L.append(
+                    f"  - evidence: {r.verification_status} "
+                    f"({r.independent_origins} origins, {r.adapter_count} adapters)"
+                )
         L.append("")
     if show_errors and res["errors"]:
         L.append("## Coverage gaps and notes (a gap is not evidence of absence)")
@@ -2561,6 +2757,8 @@ def main():
     ap.add_argument("--render", metavar="PATH",
                     help="render a JSON run (from --json full or compact) as text, no searching")
     ap.add_argument("--md", metavar="PATH", help="write a markdown report")
+    ap.add_argument("--ledger", metavar="PATH",
+                    help="write the auditable evidence ledger as JSON")
     ap.add_argument("--sources", action="store_true", help="list the source registry")
     ap.add_argument("--no-sources", action="store_true",
                     help="suppress the Sources block in stdout/--md output")
@@ -2706,6 +2904,14 @@ def main():
         with open(args.md, "w") as fh:
             fh.write(md)
         print(f"\n[report written to {args.md}]", file=sys.stderr)
+
+    if args.ledger:
+        ledger = evidence_ledger_payload(res)
+        os.makedirs(os.path.dirname(os.path.abspath(args.ledger)), exist_ok=True)
+        with open(args.ledger, "w", encoding="utf-8") as fh:
+            json.dump(ledger, fh, indent=2)
+            fh.write("\n")
+        print(f"\n[evidence ledger written to {args.ledger}]", file=sys.stderr)
 
     return 0
 
