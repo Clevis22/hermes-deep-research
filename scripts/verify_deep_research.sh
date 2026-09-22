@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Full verification suite for the deep-research skill after adding sources.
-S="$(dirname "$0")/deep_research.py"
+# Resolve the engine to an ABSOLUTE path before cd-ing, or a relative invocation
+# (bash scripts/verify_deep_research.sh) resolves against /tmp and fails.
+S="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/deep_research.py"
 cd /tmp || exit 1
 pass=0; fail=0
 chk() { # chk "label" expected actual
