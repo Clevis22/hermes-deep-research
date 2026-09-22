@@ -4,7 +4,7 @@
 # (bash scripts/verify_deep_research.sh) resolves against /tmp and fails.
 S="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/deep_research.py"
 cd /tmp || exit 1
-pass=0; fail=0
+pass=0; fail=0; gap=0
 chk() { # chk "label" expected actual
   if [ "$2" = "$3" ]; then echo "  PASS  $1 ($3)"; pass=$((pass+1));
   else echo "  FAIL  $1 (want $2, got $3)"; fail=$((fail+1)); fi
@@ -15,9 +15,11 @@ chkc() { # chkc "label" condition-result(0/1)
 }
 
 echo "=== compile + registry ==="
-python3 -m py_compile "$S" && echo "  PASS  compiles"
+python3 -m py_compile "$S"; chkc "compiles" $?
+python3 -m unittest discover -s "$(dirname "$S")/../tests" >/tmp/v_unit.txt 2>&1
+chkc "deterministic unit tests" $?
 python3 "$S" --sources > /tmp/v_reg.txt 2>&1
-grep -q "91 sources across 10 lanes" /tmp/v_reg.txt; chkc "registry = 91 sources / 10 lanes" $?
+grep -q "91 configured sources across 10 lanes" /tmp/v_reg.txt; chkc "registry = 91 sources / 10 lanes" $?
 
 echo "=== positive control: residential proxy networks ==="
 python3 "$S" "residential proxy networks" --deep --limit 5 --no-unrelated > /tmp/v_pos.txt 2>/tmp/v_pos_err.txt
@@ -33,7 +35,15 @@ python3 "$S" "CVE-2021-44228" --deep --limit 5 --no-unrelated > /tmp/v_cve.txt 2
 kev=$(grep -c 'sources:.*CISA KEV' /tmp/v_cve.txt)
 [ "$kev" -ge 1 ]; chkc "CISA KEV merged into a finding (>=1, was $kev)" $?
 grep -q '^## SECURITY' /tmp/v_cve.txt; chkc "SECURITY section present" $?
-grep -q 'sources:.*Ubuntu CVE' /tmp/v_cve.txt; chkc "Ubuntu CVE contributing" $?
+if grep -q 'sources:.*Ubuntu CVE' /tmp/v_cve.txt; then
+  echo "  PASS  Ubuntu CVE contributing"; pass=$((pass+1))
+elif grep -q 'ERR: Ubuntu CVE:' /tmp/v_cve.txt; then
+  echo "  GAP   Ubuntu CVE endpoint unavailable (reported as a coverage gap)"
+  gap=$((gap+1))
+else
+  echo "  FAIL  Ubuntu CVE returned no finding and no explicit gap"
+  fail=$((fail+1))
+fi
 grep -q 'sources:.*Red Hat CVE' /tmp/v_cve.txt; chkc "Red Hat CVE contributing" $?
 grep -q 'ERR: Red Hat' /tmp/v_cve.txt; [ "$?" = "1" ]; chkc "no Red Hat error" $?
 grep -q 'ERR: MITRE' /tmp/v_cve.txt; [ "$?" = "1" ]; chkc "no MITRE error" $?
@@ -43,8 +53,8 @@ echo "  info: $(sed -n '3p' /tmp/v_cve.txt)"
 echo "=== CWE-shaped query ==="
 python3 "$S" "CWE-89 SQL injection" --lanes security --limit 5 --no-unrelated > /tmp/v_cwe.txt 2>&1
 grep -q 'sources: MITRE CWE' /tmp/v_cwe.txt; chkc "CWE resolves" $?
-grep -q 'sources: MITRE CAPEC' /tmp/v_cwe.txt; chkc "CAPEC resolves" $?
-grep -q 'visibility:collapse' /tmp/v_cwe.txt; [ "$?" = "1" ]; chkc "CAPEC snippet is not CSS" $?
+grep -q 'CAPEC-66 related to CWE-89' /tmp/v_cwe.txt; chkc "CWE-89 maps to CAPEC-66 SQL injection" $?
+grep -q 'CAPEC-89 related to CWE-89' /tmp/v_cwe.txt; [ "$?" = "1" ]; chkc "CWE id is not reused as a CAPEC id" $?
 grep -q 'CWE-44228' /tmp/v_cwe.txt; [ "$?" = "1" ]; chkc "no CVE-as-CWE id confusion" $?
 
 echo "=== Bluesky (credentialed source) ==="
@@ -80,5 +90,5 @@ echo "=== bad lane rejected ==="
 python3 "$S" "x" --lanes nope >/dev/null 2>&1; [ "$?" != "0" ]; chkc "unknown lane exits non-zero" $?
 
 echo
-echo "RESULT: $pass passed, $fail failed"
+echo "RESULT: $pass passed, $fail failed, $gap live gaps"
 [ "$fail" = "0" ]

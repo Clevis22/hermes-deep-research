@@ -2,18 +2,44 @@
 
 Method: one keyless request per endpoint, default Python UA, documented API path.
 **Usable = HTTP 200 with a real payload.** Rate-limited endpoints were retried with
-spacing before being called dead. Probe scripts: `~/workspace/research_source_probe{,2,3,4,5}.py`.
+spacing before being called dead.
 
-> **Wired in already (registry 90 sources / 10 lanes):** Google Patents (patents lane),
+> **Wired in already (registry 91 sources / 10 lanes; 89 keyless):** Google Patents (patents lane),
 > SearXNG `packages`, the seven security-news feeds, and the security tier
 > (Red Hat CVE, Ubuntu CVE, SigmaHQ rules, MITRE CWE, MITRE CAPEC + a working
 > ExploitDB parser). **Everything else in this file is verified but NOT registered
 > yet** — add it with one `register(name, lane, build, kind, parse, ...)` call in the
 > matching lane section. Do not re-add a row that is already wired (the registry is
 > the source of truth: `deep_research.py --sources`).
-> Re-run `scripts/verify_deep_research.sh` (21 assertions) after any change.
+> Re-run `scripts/verify_deep_research.sh` (23 checks) after any change.
 
-The registry is 90 sources. These are verified, not guessed.
+The registry is 91 sources. These are verified, not guessed.
+
+## Validated next additions (2026-09-22)
+
+These are the best next integrations because they add structured evidence rather
+than another copy of ordinary web results. The first four were live-probed from
+this host on 2026-09-22.
+
+| Priority | Source | Auth / cost | Query shape and value | Suggested lane |
+|---|---|---|---|---|
+| **P0** | **GitHub Advisory Database REST API** | Keyless for public resources | CVE/GHSA, ecosystem, package/version, severity and CWE filters. A keyless `CVE-2021-44228` probe returned the critical GHSA record and four CWE links. | `security` |
+| **P0** | **deps.dev API v3** | Keyless | Exact package and version lookups across npm, PyPI, Maven, Cargo, Go, NuGet and RubyGems; adds dependencies, licenses, advisories and provenance. A keyless npm `express` probe returned 289 versions. | `code` / `security` |
+| **P0** | **OpenSSF Scorecard API** | Keyless | Repository-shaped queries return a current supply-chain score plus individual checks. Treat the score as a heuristic signal, never a vulnerability verdict. | `security` / `code` |
+| **P1** | **OpenReview API v2** | Keyless public search | Term/title/abstract/author search over ML papers, submissions and reviews. A keyless `transformer` probe returned a real Note record. | `academic` |
+| **P1** | **Semantic Scholar Academic Graph API** | Keyless for most endpoints; optional free key for a private 1-RPS quota | Direct paper, author, citation and recommendation search. Better provenance and field control than reaching it only through SearXNG. | `academic` |
+| **P1** | **GreyNoise Community API v3** | 10 unauthenticated IP lookups/day; free account up to 50/week (business email for key access) | Exact IPv4 enrichment: observed scanner status, benign service classification and last seen. Use only for IP-shaped queries. | `security` / `infra` |
+| **P1** | **FRED API** | Free registered key; up to 120 requests/minute | Primary economic time series, releases and historical vintages. Strong for economy, policy and market-context questions. | `public-data` |
+| **P1** | **abuse.ch Community APIs** (ThreatFox, URLhaus, MalwareBazaar) | Free Auth-Key under fair-use terms; commercial use may require a paid plan | IOC, malicious URL and malware-hash enrichment. Route only exact indicators to avoid noise and unnecessary calls. | `security` |
+| **P2** | **Tavily Search API** | Free key, 1,000 credits/month; pay-as-you-go $0.008/credit | General current-web fallback when the structured lanes are silent. Keep optional so the core remains keyless. | `web` |
+| **P2** | **Brave Search API** | Key required; $5 monthly credit (about 1,000 Search calls), then $5/1,000 calls; payment card required | Independent web/news/image index. Attractive as an optional broad-search fallback, but less frictionless than Tavily. | `web` / `news` |
+| **P3** | **VirusTotal Public API** | Free community key; 4 requests/minute and 500/day | Useful exact hash, URL, domain and IP enrichment, but public-tier terms prohibit commercial products/workflows. Do not enable by default. | `security` |
+
+Recommended implementation order: GitHub Advisories, deps.dev, Scorecard, then
+direct Semantic Scholar/OpenReview. Those five improve evidence quality without
+making the default run depend on a credential. Add optional providers behind
+environment variables and show them as `skipped_not_applicable` when the query is
+the wrong shape, not as coverage gaps.
 
 ## Tier 1 - closes a gap the skill itself declares
 
@@ -105,7 +131,9 @@ GDELT (429 at any spacing) - CommonCrawl index (504, and collinfo only lists ind
 **Overpass (406 both JSON-body and form-encoded)** - Fatcat (timeout) - bgpview (DNS) -
 iptoasn API (403) - ipapi.co (403) - SciELO (403 both hosts) - Wikidata SPARQL (self-
 throttles to 1 req/min) - Phishstats (522) - libraries.io (401) - eCosyste.ms (402) -
-MalwareBazaar/ThreatFox/AbuseIPDB/GreyNoise-v2/openCVE/Vulners (401-403, all keyed) -
+AbuseIPDB/openCVE/Vulners (401-403, keyed) - GreyNoise v2 (deprecated; use the v3
+Community API above) - MalwareBazaar/ThreatFox keyless requests (their free
+community APIs now require an Auth-Key; see the free-key shortlist above) -
 PatentsView (NXDOMAIN on `search.patentsview.org`; `api.patentsview.org` now serves an
 Angular page, not JSON) - HathiTrust (403) - searchcode (404) - Azure ServiceTags (404
 URL) - NIST CSRC (no JSON path) - Ars Security RSS (404) - Memento (DNS gone) -

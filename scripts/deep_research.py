@@ -106,6 +106,29 @@ def _csv_rows(text):
         return []
 
 
+def as_list(value):
+    """Normalize APIs that encode one item as an object and many as a list."""
+    if value is None:
+        return []
+    return value if isinstance(value, list) else [value]
+
+
+def _dotenv_value(name, path=None):
+    """Read one value from the environment or ``~/.hermes/.env``."""
+    if os.environ.get(name):
+        return os.environ[name]
+    path = path or os.path.expanduser("~/.hermes/.env")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line.startswith(name + "="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return None
+
+
 def dig(obj, path, default=None):
     """Tiny dotted-path getter: dig(d, 'hits.total.value'). Accepts ints for lists."""
     cur = obj
@@ -229,10 +252,11 @@ S = []  # registry
 
 
 def register(name, lane, build, kind, parse, timeout=TIMEOUT, retries=0, limit_multiplier=1,
-             headers=None):
+             headers=None, credential=None):
     S.append({"name": name, "lane": lane, "build": build, "kind": kind,
               "parse": parse, "timeout": timeout, "retries": retries,
-              "limit_multiplier": limit_multiplier, "headers": headers})
+              "limit_multiplier": limit_multiplier, "headers": headers,
+              "credential": credential})
 
 
 # --- WEB -------------------------------------------------------------------
@@ -346,10 +370,33 @@ register("DOAJ", "academic",
                                f"https://doaj.org/article/{dig(r, 'id')}")
                               for r in (dig(jload(t), "results", []) or [])[:l]], None))
 
+def _openaire_parse(text, url, q, limit):
+    rows = []
+    results = dig(jload(text), "response.results.result", []) or []
+    for raw in as_list(results)[:limit]:
+        item = dig(raw, "metadata.oaf:entity.oaf:result", {}) or {}
+        titles = as_list(item.get("title"))
+        title = next((dig(t, "$") for t in titles if dig(t, "$")), "")
+        if not title:
+            continue
+        date = str(dig(item, "dateofacceptance.$", ""))[:10]
+        creators = [str(dig(c, "$")) for c in as_list(item.get("creator")) if dig(c, "$")]
+        meta = " ".join(x for x in (date, ", ".join(creators[:2])) if x)
+        pids = as_list(item.get("pid"))
+        doi = next((str(dig(p, "$")) for p in pids
+                    if str(p.get("@classid", "")).lower() == "doi" and dig(p, "$")), None)
+        link = f"https://doi.org/{doi}" if doi else ""
+        if not link:
+            instances = as_list(dig(item, "children.instance", []))
+            link = next((dig(inst, "webresource.url.$") for inst in instances
+                         if dig(inst, "webresource.url.$")), url)
+        rows.append((clip(title, 150), clip(meta, 80), link))
+    return rows, None
+
+
 register("OpenAIRE", "academic",
          lambda q: f"https://api.openaire.eu/search/publications?keywords={q.enc}&format=json&size=6",
-         "json",
-         lambda t, u, q, l: ([], None))  # shape is deeply nested; see SKILL caveats
+         "json", _openaire_parse)
 
 
 register("HAL", "academic",
@@ -414,13 +461,26 @@ register("GitHub repos", "code",
                              ("GitHub unauthenticated search is rate-limited to ~10 req/min"
                               if dig(jload(t), "message") else None)))
 
-register("GitHub code", "code",
-         lambda q: f"https://api.github.com/search/code?q={q.enc}&per_page=6",
+def _github_code_build(q):
+    # GitHub's code-search API requires authentication. Without a token this
+    # optional source is skipped instead of producing a guaranteed 401 gap.
+    if not _dotenv_value("GITHUB_TOKEN"):
+        return None
+    return f"https://api.github.com/search/code?q={q.enc}&per_page=6"
+
+
+def _github_code_headers():
+    token = _dotenv_value("GITHUB_TOKEN")
+    return {"Authorization": f"Bearer {token}"} if token else None
+
+
+register("GitHub code", "code", _github_code_build,
          "json",
          lambda t, u, q, l: ([(clip(dig(i, "path"), 100), clip(dig(i, "repository.full_name"), 60),
                                dig(i, "html_url") or u)
                               for i in (dig(jload(t), "items", []) or [])[:l]],
-                             None))
+                             None),
+         headers=_github_code_headers, credential="GITHUB_TOKEN")
 
 register("GitLab", "code",
          lambda q: f"https://gitlab.com/api/v4/projects?search={q.enc}&per_page=6&order_by=star_count",
@@ -558,28 +618,8 @@ register("Mastodon", "community",
                               for s in (dig(jload(t), "statuses", []) or [])[:l]], None))
 
 
-def _dotenv_value(name, path=None):
-    """Read one value from ~/.hermes/.env.
-
-    The script is normally launched from a shell, which does NOT inherit the
-    values Hermes loads into its own process, so credentials are read from the
-    dotenv file directly rather than assuming they are exported.
-    """
-    if os.environ.get(name):
-        return os.environ[name]
-    path = path or os.path.expanduser("~/.hermes/.env")
-    try:
-        with open(path, encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if line.startswith(name + "="):
-                    return line.split("=", 1)[1].strip().strip('"').strip("'")
-    except OSError:
-        pass
-    return None
-
-
-# Bluesky is the one source here that needs a credential: the public AppView
+# Bluesky is one of two optional credentialed sources (with GitHub code search).
+# The public AppView
 # 403s search from this network, but an authenticated session searches fine.
 # It is optional — with no BSKY_HANDLE/BSKY_APP_PASSWORD the source simply
 # reports itself as not applicable and every other lane still runs keyless.
@@ -637,7 +677,8 @@ def _bsky_parse(text, url, q, limit):
 
 
 register("Bluesky", "community", _bsky_build, "json", _bsky_parse,
-         timeout=25, headers=_bsky_headers)
+         timeout=25, headers=_bsky_headers,
+         credential="BSKY_HANDLE + BSKY_APP_PASSWORD")
 
 
 # --- NEWS ------------------------------------------------------------------
@@ -947,26 +988,30 @@ register("SigmaHQ rules", "security",
          "text",
          lambda t, u, q, l: (_sigma_rows(t, q, l), None),
          timeout=25)
-# CAPEC attack patterns are keyless only as HTML, so the id is resolved from a
-# CWE-shaped query and the row links straight to the pattern.
-def _capec_text(t):
-    """Strip script/style blocks and tags.
+def _capec_parse(text, url, q, limit):
+    """Resolve CWE-to-CAPEC relationships from MITRE's CWE record.
 
-    Reading the raw HTML puts the page's CSS in the snippet instead of the
-    description, which is worse than no snippet at all.
+    CWE and CAPEC use independent ID namespaces: CWE-89 is SQL injection while
+    CAPEC-89 is pharming. MITRE's ``RelatedAttackPatterns`` field is the
+    authoritative mapping between them.
     """
-    t = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", t or "")
-    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", t)).strip()
+    weakness = dig(jload(text), "Weaknesses.0", {}) or {}
+    cwe = str(weakness.get("ID") or (q.cwes[0] if q.cwes else ""))
+    name = weakness.get("Name") or ""
+    ids = sorted({str(i) for i in as_list(weakness.get("RelatedAttackPatterns")) if i},
+                 key=lambda value: (not value.isdigit(),
+                                    int(value) if value.isdigit() else value))
+    rows = [(f"CAPEC-{capec} related to CWE-{cwe}", clip(name, 120),
+             f"https://capec.mitre.org/data/definitions/{capec}.html")
+            for capec in ids[:limit]]
+    note = None if rows else f"no CAPEC relationships listed for CWE-{cwe}"
+    return rows, note
 
 
 register("MITRE CAPEC", "security",
-         lambda q: (f"https://capec.mitre.org/data/definitions/{q.cwes[0]}.html"
+         lambda q: (f"https://cwe-api.mitre.org/api/v1/cwe/weakness/{q.cwes[0]}"
                     if q.cwes else None),
-         "text",
-         lambda t, u, q, l: ([(f"CAPEC-{q.cwes[0]} attack pattern",
-                               clip(_capec_text(t)[:600], 150), u)],
-                             None),
-         timeout=25)
+         "json", _capec_parse, timeout=25)
 
 register("MITRE CWE", "security",
          lambda q: (f"https://cwe-api.mitre.org/api/v1/cwe/weakness/{q.cwes[0]}"
@@ -1306,6 +1351,8 @@ def research(query, lanes=None, limit=5, workers=8, on_progress=None):
                     hit.sources.append(s)
             if not hit.meta and r.meta:
                 hit.meta = r.meta
+            # A duplicate is on-topic if any source supplied an on-topic form.
+            hit.off_topic = hit.off_topic and r.off_topic
             continue
         if tkey:
             by_title[tkey] = r
@@ -1322,7 +1369,8 @@ def research(query, lanes=None, limit=5, workers=8, on_progress=None):
         "query": query, "shape": {"cve": q.cves, "domain": q.domain, "url": q.is_url},
         "elapsed_s": round(time.time() - t0, 1),
         "sources_queried": len(chosen),
-        "sources_with_hits": len({r.source for r in unique if not r.off_topic}),
+        "sources_with_hits": len({source for r in unique if not r.off_topic
+                                  for source in r.sources}),
         "findings": unique, "by_lane": by_lane, "errors": errors,
         "unrelated_matches": unrelated,
         "empty_sources": empty, "skipped_not_applicable": skipped,
@@ -1570,8 +1618,8 @@ def collect_sources(res, include_off_topic=False):
     return out
 
 
-def markdown_sources_block(res, include_off_topic=True):
-    """Render a Sources list for grounded-citations."""
+def markdown_sources_block(res, include_off_topic=False):
+    """Render an on-topic Sources list for grounded citations."""
     return "\n".join(f"- [{t}]({u}) — {s}"
                      for t, u, s in collect_sources(res, include_off_topic))
 
@@ -1597,6 +1645,21 @@ def text_sources_block(res, max_sources=0):
         L.append(f"... {total - len(shown)} more not shown "
                  f"(raise --max-sources, or use --md for the full list)")
     return "\n".join(L)
+
+
+def markdown_report(res, include_sources=True):
+    """Build a Markdown report with one on-topic citation block."""
+    md = text_report(res)
+    if include_sources:
+        sources = markdown_sources_block(res)
+        if sources:
+            md += "\n\n## Sources\n\n" + sources + "\n"
+    if res.get("full_text"):
+        md += "\n## Full text\n\n"
+        for ft in res["full_text"]:
+            body = ft["text"] or "(failed: " + str(ft["error"]) + ")"
+            md += f"### {ft['url']}\n\n{body}\n\n"
+    return md
 
 
 def main():
@@ -1635,7 +1698,10 @@ def main():
             for n in names:
                 print(f"  - {n}")
             total += len(names)
-        print(f"\n{total} sources across {len(by_lane)} lanes. No API keys required.")
+        credentialed = [s["name"] for s in S if s.get("credential")]
+        print(f"\n{total} configured sources across {len(by_lane)} lanes: "
+              f"{total - len(credentialed)} keyless, {len(credentialed)} optional "
+              f"credentialed ({', '.join(credentialed)}).")
         return 0
 
     if args.render:
@@ -1713,14 +1779,7 @@ def main():
                 print()
 
     if args.md:
-        md = text_report(res)
-        if not args.no_sources:
-            md += "\n\n" + text_sources_block(res, max_sources=0)
-        md += "\n## Sources\n\n" + markdown_sources_block(res) + "\n"
-        if res.get("full_text"):
-            md += "\n## Full text\n\n"
-            for ft in res["full_text"]:
-                md += f"### {ft['url']}\n\n{ft['text'] or '(failed: ' + str(ft['error']) + ')'}\n\n"
+        md = markdown_report(res, include_sources=not args.no_sources)
         os.makedirs(os.path.dirname(os.path.abspath(args.md)), exist_ok=True)
         with open(args.md, "w") as fh:
             fh.write(md)

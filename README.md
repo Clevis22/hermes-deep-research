@@ -1,8 +1,9 @@
 # hermes-deep-research
 
-One query, fanned across **91 keyless sources in 10 lanes** in parallel, merged,
-deduplicated and grouped — with per-source coverage accounting, so a source that
-failed is reported as a gap rather than as "no results".
+One query, fanned across **91 configured sources in 10 lanes** in parallel,
+merged, deduplicated and grouped — with per-source coverage accounting, so a
+source that failed is reported as a gap rather than as "no results". **89 work
+without credentials**; GitHub code search and Bluesky are optional.
 
 Built as a [Hermes Agent](https://github.com/NousResearch/hermes-agent) skill,
 but `scripts/deep_research.py` is **stdlib-only Python 3** and runs standalone.
@@ -14,8 +15,9 @@ or a threat assessment you need the primary sources: the CVE record, the vendor
 advisory that says whether a fix shipped, the paper, the exploit, the filing, the
 patent. This runs ~90 of those at once and tells you which ones stayed silent.
 
-Nothing needs an API key. Only two endpoints are optional and credentialed
-(see [Optional credentials](#optional-credentials)).
+The core sweep needs no API key. Two sources are optional and credentialed (see
+[Optional credentials](#optional-credentials)); without them, those sources are
+reported as not applicable rather than as failures.
 
 ## Quick start
 
@@ -23,7 +25,7 @@ Nothing needs an API key. Only two endpoints are optional and credentialed
 python3 scripts/deep_research.py "residential proxy networks" --deep
 python3 scripts/deep_research.py "CVE-2021-44228" --deep
 python3 scripts/deep_research.py "CWE-89 SQL injection" --lanes security
-python3 scripts/deep_research.py "topic" --quick          # 51 sources, ~9s
+python3 scripts/deep_research.py "topic" --quick          # 50 keyless + optional Bluesky
 python3 scripts/deep_research.py --sources                # list the registry
 ```
 
@@ -57,8 +59,9 @@ carried it. A CVE found by both NVD and CISA KEV becomes one line reading
 `sources: NVD, CISA KEV`.
 
 **Query shapes are respected.** CVE-id APIs are only queried when the query
-contains a `CVE-…`; CWE/CAPEC need an explicit `CWE-<n>` (a CVE id is never read
-as a CWE number); domain APIs need a domain; package APIs answer single tokens.
+contains a `CVE-…`; MITRE's explicit CWE relationships are used to resolve
+CAPEC patterns for an explicit `CWE-<n>` (the two ID namespaces are never
+assumed to match); domain APIs need a domain; package APIs answer single tokens.
 Misfits are reported as "not applicable" instead of failing.
 
 **Every run ends with a numbered Sources block** (`[n]`-citeable) containing
@@ -73,6 +76,9 @@ Set them in `~/.hermes/.env` (mode 0600) — the script reads that file directly
 because a shell does not inherit the variables Hermes loads into its own process:
 
 ```
+# GitHub code search: a fine-grained token with read-only access is sufficient.
+GITHUB_TOKEN=github_pat_xxxx
+
 # Bluesky: the public AppView 403s search from many networks; auth fixes it.
 # Use an APP PASSWORD (Settings -> App Passwords), not the account password.
 # The identifier is the HANDLE (khermes.bsky.social), never an email form.
@@ -89,9 +95,12 @@ placeholder, not a secret.
 bash scripts/verify_deep_research.sh
 ```
 
-22 assertions: compilation, the registry count, both positive and negative
-controls, CWE/CAPEC resolution, the credentialed source, Sources-block flags,
-JSON round-trip, and lane validation. Run it after any source change.
+The verifier runs deterministic unit tests first, then live positive and
+negative controls for the registry, CWE/CAPEC resolution, optional credentials,
+Sources-block flags, JSON round-tripping, and lane validation. Run it after any
+source change; live assertions can fail when an upstream endpoint drifts.
+Transient upstream failures that the report correctly exposes are counted as
+live gaps rather than deterministic test failures.
 
 Bluesky auth can be checked on its own with `python3 scripts/bsky_probe.py`.
 
@@ -114,7 +123,7 @@ Bluesky auth can be checked on its own with `python3 scripts/bsky_probe.py`.
 ## Costs
 
 A warm deep run is **8–25s**. Don't use `--deep` for a one-fact lookup — that is
-90 HTTP requests for nothing; plain search is one call.
+roughly 90 HTTP requests for nothing; plain search is one call.
 
 ## Licence
 

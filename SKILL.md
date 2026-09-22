@@ -1,7 +1,7 @@
 ---
 name: deep-research
-description: "Use when the user asks for deep research or a multi-source sweep. Fans one query across 90 keyless sources."
-version: 1.3.0
+description: "Use when the user asks for deep research or a multi-source sweep. Fans one query across 91 configured sources; 89 are keyless."
+version: 1.4.0
 author: Hermes Agent
 license: MIT
 platforms: [linux]
@@ -14,9 +14,10 @@ metadata:
 # Deep Research
 
 Trigger: **"deep research X"**, "research X thoroughly", "sweep the literature on
-X", "what's the evidence for X". One command fans the query across **90 keyless
-sources in 10 lanes**, in parallel, merged and grouped, with per-source coverage
-accounting. Nothing here needs an API key.
+X", "what's the evidence for X". One command fans the query across **91
+configured sources in 10 lanes**, in parallel, merged and grouped, with
+per-source coverage accounting. **89 are keyless**; GitHub code search and
+Bluesky are optional credentialed sources.
 
 ## When to use
 
@@ -30,16 +31,16 @@ accounting. Nothing here needs an API key.
 - Before writing anything citable — pair with `grounded-citations`.
 
 **Not for**: single-fact lookups, casual questions, or "what's the weather".
-Use plain `web_search` — it is one call instead of 90.
+Use plain `web_search` — it is one call instead of roughly 90.
 
 ## How to run
 
 ```bash
 S=~/.hermes/skills/research/deep-research/scripts/deep_research.py
 
-python3 "$S" "residential proxy networks" --deep                 # all 90 sources
+python3 "$S" "residential proxy networks" --deep                 # all 91 configured sources
 python3 "$S" "residential proxy networks" --deep --read 3 --md ~/dr.md
-python3 "$S" "topic" --quick                                     # 50 sources
+python3 "$S" "topic" --quick                                     # 50 keyless + optional Bluesky
 python3 "$S" "log4j" --lanes academic,community,security
 python3 "$S" "CVE-2021-44228" --deep                             # CVE shape
 python3 "$S" "CWE-89" --lanes security                           # CWE/CAPEC shape
@@ -65,14 +66,14 @@ python3 "$S" --sources                                           # list the regi
 | `--live` | stream per-source progress to stderr |
 | `--workers N` | concurrency (default 8; raise to 12 if the box is idle) |
 
-## The 10 lanes (90 sources, all verified from this Pi)
+## The 10 lanes (91 configured sources; 89 keyless)
 
 | Lane | Sources |
 |---|---|
 | **web** (2) | SearXNG general, SearXNG web |
 | **academic** (16) | SearXNG **scientific publications** (reaches Google Scholar + Semantic Scholar — the highest-value row in the registry), Crossref, OpenAlex, arXiv, PubMed, Europe PMC, Zenodo, DataCite, DOAJ, OpenAIRE, HAL, OSF, Figshare, Unpaywall (OA PDF), OpenCitations, HF Papers |
-| **code** (14) | SearXNG repos, SearXNG IT, **SearXNG packages** (8 registries in one call), GitHub repos, GitHub code, GitLab, Codeberg, npm, crates.io, Packagist, Maven, Docker Hub, HuggingFace models, Software Heritage |
-| **community** (12) | SearXNG social, SearXNG Q&A, Hacker News, Reddit (pullpush), Security.SE, StackOverflow, ServerFault, SuperUser, Lemmy, Dev.to, Mastodon, **Bluesky** (credentialed — see below) |
+| **code** (14) | SearXNG repos, SearXNG IT, **SearXNG packages** (8 registries in one call), GitHub repos, **GitHub code** (optional token), GitLab, Codeberg, npm, crates.io, Packagist, Maven, Docker Hub, HuggingFace models, Software Heritage |
+| **community** (12) | SearXNG social, SearXNG Q&A, Hacker News, Reddit (pullpush), Security.SE, StackOverflow, ServerFault, SuperUser, Lemmy, Dev.to, Mastodon, **Bluesky** (optional app password) |
 | **news** (11) | SearXNG news, Bing News RSS, Google News RSS, BleepingComputer, Krebs on Security, The Record, The Hacker News, SecurityWeek, Dark Reading, Cisco Security Advisories |
 | **regulatory** (7) | SEC EDGAR full-text, Federal Register, Congress.gov, GovTrack, CourtListener, openFEC, ClinicalTrials.gov |
 | **security** (16) | CISA KEV, NVD, EPSS, CIRCL CVE, OSV, CertSpotter CT, Shodan InternetDB, RIPEstat, AlienVault OTX, OpenPhish, ExploitDB, **Red Hat CVE, Ubuntu CVE, SigmaHQ rules, MITRE CWE, MITRE CAPEC** |
@@ -82,8 +83,9 @@ python3 "$S" --sources                                           # list the regi
 
 **Query shapes matter.** Sources are only queried when the shape fits: CVE-id
 APIs (EPSS, CIRCL, Red Hat per-CVE) need a `CVE-…` in the query; **CWE/CAPEC need
-an explicit `CWE-<n>`** (a CVE id is never read as a CWE number); domain APIs
-(CertSpotter, OTX, urlscan, Wayback) need a domain; package APIs answer single
+an explicit `CWE-<n>`**. CAPEC results come from MITRE's
+`RelatedAttackPatterns` mapping—the CWE number is never reused as a CAPEC ID;
+domain APIs (CertSpotter, OTX, urlscan, Wayback) need a domain; package APIs answer single
 tokens. Misfits are listed under "not applicable" rather than failing.
 
 **The vendor-advisory tier is the point of the security lane.** NVD and CISA KEV
@@ -98,7 +100,10 @@ HTTP 503 for a while (measured: 3 clean runs, then 5/5 503 — not a UA problem)
 It is worth a retry, and a 503 is reported as a coverage gap. Never read a
 patents gap as "no patents exist".
 
-**Bluesky is the one source that needs a credential.** The public AppView 403s
+**Two sources accept optional credentials.** GitHub code search requires a
+`GITHUB_TOKEN`; without one it is skipped as not applicable. Use a fine-grained,
+read-only token and place it in `~/.hermes/.env` alongside the Bluesky values.
+Bluesky's public AppView 403s
 `searchPosts` from this network, but an authenticated session works. The
 credential lives in `~/.hermes/.env` as `BSKY_HANDLE` + `BSKY_APP_PASSWORD`
 (an app password, **not** the account password) and is read directly from that
@@ -117,7 +122,11 @@ With no `BSKY_` credential the source reports itself as *not applicable* and
 every other lane still runs keyless — a missing credential must never surface as
 a failure. Verify with `scripts/bsky_probe.py`.
 
-## Measured results (2026-09-22, this Pi — after the source expansion)
+## Historical measured results (2026-09-22, this Pi)
+
+These measurements predate the corrected corroborating-source accounting and
+the 91-source registry. Retain them as latency guidance, not current acceptance
+numbers; refresh the table after the next full live verification.
 
 | Query | Result | Time |
 |---|---|---|
@@ -185,8 +194,8 @@ in the response rather than having to re-run anything or open a file. Pair with
 within one run, so copy the URLs out of the block rather than retyping them.
 
 The block lists **on-topic rows only**. Off-topic matches are deliberately excluded,
-because those are exactly the rows that must not reach a reference list. `--md` keeps
-its own link-form `## Sources` block and the plain-text one, with no cap.
+because those are exactly the rows that must not reach a reference list. `--md`
+writes one link-form `## Sources` block with no cap.
 
 - Default cap is 30 rows; the block says `... N more not shown` when it truncates.
   Raise `--max-sources` (or `0` for all) when writing a full reference list.
@@ -240,9 +249,9 @@ which is what removed the repeated Crossref/Google-Scholar pairs.
   Omitting it once cost the NDSS residential-proxy-detection paper entirely. Its
   results arrive ordered by position, and relevant papers can sit ~11 deep, so
   SearXNG sources are read with `limit_multiplier=5` (5 × `--limit` rows).
-- **Cross-source duplicates are corroboration, not noise.** Merging by URL alone
-  deleted the CISA KEV entry whenever an NVD row shared its
-  `nvd.nist.gov/vuln/detail/<id>` link. Merge key is title *and* URL.
+- **Cross-source duplicates are corroboration, not noise.** Rows with the same
+  normalized title or URL merge, but every contributing source remains in the
+  finding's `sources` list and in `sources_with_hits` accounting.
 - **NVD `keywordSearch` matches CVE text, not nicknames** — `log4shell` → 0,
   `log4j` → 34. Pass the CVE id and the script does an exact `cveId=` lookup.
 - **CISA KEV matches vendor/product text**, substring-wise. CVE ids are stripped
@@ -251,8 +260,9 @@ which is what removed the repeated Crossref/Google-Scholar pairs.
 - **OpenAlex needs `&mailto=`** — anonymous search 429s. It is a courtesy
   header, not a credential, and it still throttles under rapid repeats (one
   retry with backoff is built in).
-- **GitHub code search needs auth** (401 keyless). GitHub *repo* search works
-  but is capped at ~10 req/min.
+- **GitHub code search needs auth.** Configure `GITHUB_TOKEN` for this optional
+  source; without it the source is skipped instead of producing a guaranteed
+  401 gap. GitHub *repo* search remains keyless but is capped at ~10 req/min.
 - **Wayback CDX 503s intermittently**; one retry is built in.
 - **Reddit's own JSON 403s** from this network — pullpush is the working mirror
   and it 429s sometimes too.
@@ -295,7 +305,8 @@ which is what removed the repeated Crossref/Google-Scholar pairs.
 ## Verified additions (2026-09-22)
 
 A five-round keyless probe of ~230 endpoints from this Pi took the registry from
-76 to **90 sources**. What was added:
+76 to **90 sources**; adding optional Bluesky later brought the configured
+registry to 91. What was added:
 
 - **patents lane (new)** — Google Patents `xhr/query`, best-effort.
 - **code** — SearXNG `packages` (crates.io, npm, Packagist, Hex, pkg.go.dev,
@@ -311,9 +322,10 @@ Full per-endpoint evidence, tiered candidates not yet wired in (public-data,
 infra-attribution, academic, community), and the confirmed-dead list live in
 `references/candidate-sources.md`.
 
-Re-verify with `~/workspace/verify_deep_research.sh` (21 assertions: both
-controls, CWE/CAPEC resolution, Sources-block flags, JSON round-trip, lane
-validation).
+Re-verify with `bash scripts/verify_deep_research.sh`. It runs deterministic
+unit tests before the live controls for CWE/CAPEC resolution, Sources-block
+flags, JSON round-tripping, and lane validation. A transient upstream failure
+that is correctly surfaced is reported as a live gap, not a parser failure.
 
 ## Dead sources — do not re-add without re-testing
 
@@ -377,8 +389,8 @@ Negative controls:
   (off-topic rows stay out of the citation list). Assert with
   `sed -n '/^## Sources (/,$p' out.txt | grep -ci painting` → expect 0.
 - `--max-sources 5` prints exactly 5 `[n]` entries plus a `more not shown` line;
-  `--max-sources 0` prints all and no truncation line; `--no-sources` prints none.
-  `--md` still writes its link-form `## Sources` block under `--no-sources`.
+  `--max-sources 0` prints all and no truncation line; `--no-sources` suppresses
+  Sources blocks in both stdout and `--md` output.
 - Round-trip: `--json compact > r.json && --render r.json` must print one
   `## Sources (N unique — cite as [n])` header and the same on-topic count as
   `--json` full reported. `--render` on a **full** dump must still work (it prints
