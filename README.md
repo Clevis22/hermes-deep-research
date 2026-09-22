@@ -74,8 +74,8 @@ NCT, patent and package shapes force their relevant lanes with local rules, so
 Jev cannot veto them; a bare exact identifier is routed locally without calling
 Jev. For ambiguous natural-language queries, Jev scores nine
 independent lane questions in one request; lanes over the probability threshold
-plus the two strongest lanes are selected. A missing key, API failure or flat
-low-confidence distribution widens to a conservative local fallback. Use
+and up to two strong, plausible runners-up are selected. A missing key, API
+failure or flat low-confidence distribution widens to a conservative local fallback. Use
 `--auto --plan` to see the route and request count without querying research
 sources. `--deep` remains the explicit exhaustive mode.
 
@@ -138,7 +138,7 @@ Bluesky auth can be checked on its own with `python3 scripts/bsky_probe.py`.
 | `--auto` | deterministic exact-shape routing plus optional Jev lane scoring |
 | `--lanes a,b` | pick lanes |
 | `--plan` | print the selected route without querying research sources |
-| `--auto-threshold P` | Jev inclusion probability, 0–1 (default `0.55`) |
+| `--auto-threshold P` | Jev inclusion probability, 0–1 (default `0.70`) |
 | `--limit N` | rows per source (default 5) |
 | `--read N` | pull full text of the top N URLs (needs a local extractor on :3002) |
 | `--md PATH` | write a markdown report incl. a Sources block |

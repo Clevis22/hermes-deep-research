@@ -60,7 +60,7 @@ python3 "$S" --sources                                           # list the regi
 | `--auto` | exact-shape rules + optional Jev semantic lane routing |
 | `--lanes a,b` | pick lanes: `web academic code community news regulatory security reference archive patents` |
 | `--plan` | print the route without querying research sources |
-| `--auto-threshold P` | Jev lane probability threshold (default `0.55`) |
+| `--auto-threshold P` | Jev lane probability threshold (default `0.70`) |
 | `--limit N` | rows per source (default 5) |
 | `--read N` | also pull full text of the top N URLs via local PiExtract |
 | `--md PATH` | write a markdown report incl. a Sources block |

@@ -39,7 +39,9 @@ class AutoRoutingTests(unittest.TestCase):
         })
 
     def test_jev_routes_ambiguous_query_to_top_relevant_lanes(self):
-        body = self.jev_response(academic=0.94, security=0.88, news=0.31)
+        body = self.jev_response(
+            academic=0.94, security=0.88, news=0.69, patents=0.68
+        )
         with mock.patch.object(deep_research, "http", return_value=(body, None)):
             route = deep_research.auto_route(
                 "residential proxy detection research", api_key="test-key"
@@ -49,6 +51,7 @@ class AutoRoutingTests(unittest.TestCase):
         self.assertEqual(route["selected_lanes"], ["web", "academic", "security"])
         self.assertEqual(route["probabilities"]["academic"], 0.94)
         self.assertFalse(route["fallback"])
+        self.assertNotIn("news", route["selected_lanes"])
 
     def test_exact_cve_forces_security_even_when_jev_says_no(self):
         with mock.patch.object(deep_research, "http") as mocked_http:
@@ -102,6 +105,15 @@ class AutoRoutingTests(unittest.TestCase):
             set(captured["payload"]["questions"]),
             {f"lane_{lane}" for lane in deep_research.AUTO_LANE_QUESTIONS},
         )
+
+    def test_low_probability_runner_up_is_not_forced(self):
+        body = self.jev_response(reference=0.94, academic=0.13)
+        with mock.patch.object(deep_research, "http", return_value=(body, None)):
+            route = deep_research.auto_route(
+                "history of the Eiffel Tower", api_key="test-key"
+            )
+
+        self.assertEqual(route["selected_lanes"], ["web", "reference"])
 
 
 class ParserTests(unittest.TestCase):

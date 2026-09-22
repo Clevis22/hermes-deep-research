@@ -55,7 +55,7 @@ OPENROUTER_DECISIONS_URL = os.environ.get(
     "OPENROUTER_DECISIONS_URL", "https://openrouter.ai/api/alpha/decisions"
 )
 JEV_MODEL = os.environ.get("JEV_MODEL", "typesafe/jev-1.13")
-AUTO_THRESHOLD = 0.55
+AUTO_THRESHOLD = 0.70
 
 
 # ---------------------------------------------------------------------------
@@ -251,42 +251,44 @@ class Q:
 # below and cannot be vetoed by the model.
 AUTO_LANE_QUESTIONS = {
     "academic": (
-        "Would scholarly papers, preprints, research datasets, citations, or "
-        "scientific literature materially help answer `research_query`?"
+        "Does `research_query` substantially require scholarly papers, preprints, "
+        "research datasets, citations, or scientific evidence, rather than merely "
+        "benefiting from general background reading?"
     ),
     "code": (
-        "Would source-code repositories, package registries, software artifacts, "
-        "container images, or model registries materially help answer `research_query`?"
+        "Is `research_query` directly about software implementation, repositories, "
+        "packages, source code, containers, models, or other software artifacts?"
     ),
     "community": (
-        "Would forums, technical Q&A, social posts, or first-hand community "
-        "discussion materially help answer `research_query`?"
+        "Does `research_query` call for first-hand experiences, opinions, practitioner "
+        "workarounds, public reaction, or community discussion that primary and "
+        "reference sources would not adequately supply?"
     ),
     "news": (
-        "Would current or recent journalism, announcements, or news reporting "
-        "materially help answer `research_query`?"
+        "Are current events, recent developments, announcements, or journalistic "
+        "reporting central to answering `research_query`?"
     ),
     "regulatory": (
-        "Would laws, government records, corporate filings, court opinions, "
-        "legislation, campaign data, or clinical-trial records materially help "
-        "answer `research_query`?"
+        "Is `research_query` directly about laws, court opinions, legislation, "
+        "government action, corporate filings, elections, or clinical trials? "
+        "Patent-office records alone belong to the patents lane, not this lane."
     ),
     "security": (
-        "Would vulnerability, exploit, malware, threat-intelligence, defensive-rule, "
-        "certificate, domain, IP, or network-security sources materially help answer "
-        "`research_query`?"
+        "Is `research_query` directly about cybersecurity, vulnerabilities, exploits, "
+        "malware, abuse, threat intelligence, defensive rules, certificates, domains, "
+        "IP addresses, or network-security investigation?"
     ),
     "reference": (
-        "Would encyclopedic, bibliographic, geographic, catalogue, linked-data, or "
-        "general reference sources materially help answer `research_query`?"
+        "Is stable factual, encyclopedic, bibliographic, geographic, catalogue, or "
+        "linked-data reference material a primary evidence type for `research_query`?"
     ),
     "archive": (
-        "Would historical website snapshots or prior scans of a specific domain or "
-        "URL materially help answer `research_query`?"
+        "Does `research_query` require past versions, deleted material, change over "
+        "time, or historical snapshots of a specific website or URL?"
     ),
     "patents": (
-        "Would patents, inventions, assignees, or prior-art records materially help "
-        "answer `research_query`?"
+        "Does `research_query` explicitly concern patents, inventions, inventors, "
+        "assignees, patent ownership, patentability, or prior art?"
     ),
 }
 
@@ -395,7 +397,14 @@ def jev_lane_scores(q, api_key=None):
     }
     payload = {
         "model": JEV_MODEL,
-        "state": {"research_query": q.raw},
+        "state": {
+            "research_query": q.raw,
+            "routing_policy": (
+                "Choose only lanes likely to provide direct evidence needed for the "
+                "answer. Do not select a lane merely because it could add tangential "
+                "context. Each lane has a distinct purpose."
+            ),
+        },
         "questions": questions,
     }
     text, err = http(
@@ -460,13 +469,15 @@ def auto_route(query, threshold=AUTO_THRESHOLD, api_key=None):
                 selected.add(lane)
                 reasons.setdefault(lane, f"Jev probability {probability:.2f}")
 
-        # Natural-language queries get the two strongest semantic lanes even
-        # when they sit just below the threshold. Exact identifiers already
-        # have high-recall forced routes and do not need this widening.
+        # Natural-language queries may get up to two strong semantic lanes just
+        # below the threshold, but never force an implausible runner-up. Exact
+        # identifiers already have high-recall routes and need no widening.
         if forced == {"web"}:
+            plausibility_floor = min(threshold, 0.35)
             for lane, probability in sorted(scores.items(), key=lambda item: item[1], reverse=True)[:2]:
-                selected.add(lane)
-                reasons.setdefault(lane, f"top Jev probability {probability:.2f}")
+                if probability >= plausibility_floor:
+                    selected.add(lane)
+                    reasons.setdefault(lane, f"top Jev probability {probability:.2f}")
 
         # A flat distribution near 0.5 means the router is unsure. Widen to the
         # existing quick set instead of silently dropping a useful lane.
