@@ -1,7 +1,7 @@
 ---
 name: deep-research
-description: "Use when the user asks for deep research or a multi-source sweep. Fans one query across 91 configured sources; 89 are keyless."
-version: 1.5.0
+description: "Use when the user asks for deep research or a multi-source sweep. Routes one query across 101 configured sources; 99 are keyless."
+version: 1.6.0
 author: Hermes Agent
 license: MIT
 platforms: [linux]
@@ -14,9 +14,9 @@ metadata:
 # Deep Research
 
 Trigger: **"deep research X"**, "research X thoroughly", "sweep the literature on
-X", "what's the evidence for X". One command fans the query across **91
-configured sources in 10 lanes**, in parallel, merged and grouped, with
-per-source coverage accounting. **89 are keyless**; GitHub code search and
+X", "what's the evidence for X". One command routes the query across **101
+configured sources in 11 lanes**, in parallel, merged and grouped, with
+per-source coverage accounting. **99 are keyless**; GitHub code search and
 Bluesky are optional credentialed sources. `--auto` can use Jev to select
 relevant lanes while deterministic rules protect exact identifiers.
 
@@ -28,22 +28,22 @@ relevant lanes while deterministic rules protect exact identifiers.
   proxy networks).
 - Cyber topics where the CVE, advisory and filing lanes matter: the security
   lane alone reaches CISA KEV, NVD, EPSS, CIRCL, OSV and CT logs.
-- A domain or IP target (use `--lanes security,archive,reference`).
+- A domain or IP target (use `--lanes security,osint,archive,reference`).
 - Before writing anything citable — pair with `grounded-citations`.
 
 **Not for**: single-fact lookups, casual questions, or "what's the weather".
-Use plain `web_search` — it is one call instead of roughly 90.
+Use plain `web_search` — it is one call instead of roughly 100 configured sources.
 
 ## How to run
 
 ```bash
 S=~/.hermes/skills/research/deep-research/scripts/deep_research.py
 
-python3 "$S" "residential proxy networks" --deep                 # all 91 configured sources
+python3 "$S" "residential proxy networks" --deep                 # all 101 configured sources
 python3 "$S" "residential proxy networks" --auto                 # relevant lanes only
 python3 "$S" "residential proxy networks" --auto --plan          # explain; no source calls
 python3 "$S" "residential proxy networks" --deep --read 3 --md ~/dr.md
-python3 "$S" "topic" --quick                                     # 50 keyless + optional Bluesky
+python3 "$S" "topic" --quick                                     # 52 keyless + optional Bluesky
 python3 "$S" "log4j" --lanes academic,community,security
 python3 "$S" "CVE-2021-44228" --deep                             # CVE shape
 python3 "$S" "CWE-89" --lanes security                           # CWE/CAPEC shape
@@ -55,10 +55,10 @@ python3 "$S" --sources                                           # list the regi
 
 | Flag | Purpose |
 |---|---|
-| `--deep` | all 10 lanes (default) |
+| `--deep` | all 11 lanes (default) |
 | `--quick` | web+academic+community+news+reference only |
 | `--auto` | exact-shape rules + optional Jev semantic lane routing |
-| `--lanes a,b` | pick lanes: `web academic code community news regulatory security reference archive patents` |
+| `--lanes a,b` | pick lanes: `web academic code community news regulatory security osint reference archive patents` |
 | `--plan` | print the route without querying research sources |
 | `--auto-threshold P` | Jev lane probability threshold (default `0.70`) |
 | `--limit N` | rows per source (default 5) |
@@ -72,17 +72,18 @@ python3 "$S" --sources                                           # list the regi
 | `--live` | stream per-source progress to stderr |
 | `--workers N` | concurrency (default 8; raise to 12 if the box is idle) |
 
-## The 10 lanes (91 configured sources; 89 keyless)
+## The 11 lanes (101 configured sources; 99 keyless)
 
 | Lane | Sources |
 |---|---|
 | **web** (2) | SearXNG general, SearXNG web |
-| **academic** (16) | SearXNG **scientific publications** (reaches Google Scholar + Semantic Scholar — the highest-value row in the registry), Crossref, OpenAlex, arXiv, PubMed, Europe PMC, Zenodo, DataCite, DOAJ, OpenAIRE, HAL, OSF, Figshare, Unpaywall (OA PDF), OpenCitations, HF Papers |
-| **code** (14) | SearXNG repos, SearXNG IT, **SearXNG packages** (8 registries in one call), GitHub repos, **GitHub code** (optional token), GitLab, Codeberg, npm, crates.io, Packagist, Maven, Docker Hub, HuggingFace models, Software Heritage |
+| **academic** (18) | SearXNG **scientific publications**, Crossref, OpenAlex, **Semantic Scholar, OpenReview**, arXiv, PubMed, Europe PMC, Zenodo, DataCite, DOAJ, OpenAIRE, HAL, OSF, Figshare, Unpaywall, OpenCitations, HF Papers |
+| **code** (15) | SearXNG repos, SearXNG IT, SearXNG packages, GitHub repos, GitHub code, GitLab, Codeberg, **deps.dev**, npm, crates.io, Packagist, Maven, Docker Hub, HuggingFace models, Software Heritage |
 | **community** (12) | SearXNG social, SearXNG Q&A, Hacker News, Reddit (pullpush), Security.SE, StackOverflow, ServerFault, SuperUser, Lemmy, Dev.to, Mastodon, **Bluesky** (optional app password) |
 | **news** (11) | SearXNG news, Bing News RSS, Google News RSS, BleepingComputer, Krebs on Security, The Record, The Hacker News, SecurityWeek, Dark Reading, Cisco Security Advisories |
 | **regulatory** (7) | SEC EDGAR full-text, Federal Register, Congress.gov, GovTrack, CourtListener, openFEC, ClinicalTrials.gov |
-| **security** (16) | CISA KEV, NVD, EPSS, CIRCL CVE, OSV, CertSpotter CT, Shodan InternetDB, RIPEstat, AlienVault OTX, OpenPhish, ExploitDB, **Red Hat CVE, Ubuntu CVE, SigmaHQ rules, MITRE CWE, MITRE CAPEC** |
+| **security** (18) | CISA KEV, NVD, EPSS, CIRCL CVE, OSV, **GitHub Advisories, OpenSSF Scorecard**, CertSpotter CT, Shodan InternetDB, RIPEstat, AlienVault OTX, OpenPhish, ExploitDB, Red Hat CVE, Ubuntu CVE, SigmaHQ rules, MITRE CWE, MITRE CAPEC |
+| **osint** (5) | **RDAP, PeeringDB, GLEIF, OFAC SDN, OFAC Consolidated** |
 | **reference** (10) | SearXNG files, Wikipedia, Wikipedia search, Wikidata, Commons, OpenLibrary, Internet Archive, DBpedia, Datamuse, Nominatim |
 | **archive** (2) | Wayback CDX, urlscan.io |
 | **patents** (1) | Google Patents (`xhr/query`) — best-effort, see below |
@@ -91,8 +92,10 @@ python3 "$S" --sources                                           # list the regi
 APIs (EPSS, CIRCL, Red Hat per-CVE) need a `CVE-…` in the query; **CWE/CAPEC need
 an explicit `CWE-<n>`**. CAPEC results come from MITRE's
 `RelatedAttackPatterns` mapping—the CWE number is never reused as a CAPEC ID;
-domain APIs (CertSpotter, OTX, urlscan, Wayback) need a domain; package APIs answer single
-tokens. Misfits are listed under "not applicable" rather than failing.
+domain APIs need a domain; package and repository enrichers require explicit
+shapes. OFAC runs only for explicit sanctions queries, caches its official bulk
+XML for 24 hours, and labels every name hit as requiring manual verification.
+Misfits are listed under "not applicable" rather than failing.
 
 **The vendor-advisory tier is the point of the security lane.** NVD and CISA KEV
 describe a vulnerability; Red Hat, Ubuntu and Cisco say whether a fix actually
@@ -115,13 +118,18 @@ credential lives in `~/.hermes/.env` as `BSKY_HANDLE` + `BSKY_APP_PASSWORD`
 (an app password, **not** the account password) and is read directly from that
 file, because the shell that runs this script does not inherit Hermes' env.
 
+Semantic Scholar works without authentication but its public quota is shared
+and frequently returns 429. A free `SEMANTIC_SCHOLAR_API_KEY` in the same env
+file gives the direct adapter a private 1-request-per-second quota; SearXNG
+science remains the fallback.
+
 **Jev routing is optional.** Put `OPENROUTER_API_KEY` in `~/.hermes/.env` to
 enable semantic lane scoring for `--auto`. The pinned default is
 `typesafe/jev-1.13`; override it with `JEV_MODEL` only after re-running the
-routing tests. Exact CVE/CWE, domain, URL, IP, ASN, hash, DOI, arXiv, NCT,
-patent and explicit package shapes are routed locally and cannot be vetoed by
-Jev; a bare exact identifier does not call Jev at all. If the key is absent,
-the Decisions endpoint fails, or the probabilities are uniformly uncertain,
+routing tests. Exact CVE/GHSA/CWE, domain, URL, IP, ASN, LEI, hash, DOI, arXiv,
+NCT, patent, repository and explicit package shapes are routed locally and
+cannot be vetoed by Jev; a bare exact identifier does not call Jev at all. If
+the key is absent, the Decisions endpoint fails, or the probabilities are uniformly uncertain,
 the command widens to a conservative local fallback. Use `--auto --plan` to
 audit the selected lanes before a live sweep.
 
@@ -141,7 +149,7 @@ a failure. Verify with `scripts/bsky_probe.py`.
 ## Historical measured results (2026-09-22, this Pi)
 
 These measurements predate the corrected corroborating-source accounting and
-the 91-source registry. Retain them as latency guidance, not current acceptance
+the 101-source registry. Retain them as latency guidance, not current acceptance
 numbers; refresh the table after the next full live verification.
 
 | Query | Result | Time |
@@ -260,8 +268,9 @@ which is what removed the repeated Crossref/Google-Scholar pairs.
 - **`--deep` on every question is waste.** A simple lookup should use `--auto`,
   `--quick`, or plain web search. Reserve `--deep` for a genuinely exhaustive
   sweep.
-- **SearXNG `scientific publications` is the load-bearing source.** It reaches
-  Google Scholar and Semantic Scholar, which no standalone keyless API here can.
+- **SearXNG `scientific publications` remains load-bearing.** It reaches Google
+  Scholar and provides redundancy when the direct Semantic Scholar public pool
+  returns 429.
   Omitting it once cost the NDSS residential-proxy-detection paper entirely. Its
   results arrive ordered by position, and relevant papers can sit ~11 deep, so
   SearXNG sources are read with `limit_multiplier=5` (5 × `--limit` rows).
@@ -320,22 +329,27 @@ which is what removed the repeated Crossref/Google-Scholar pairs.
 
 ## Verified additions (2026-09-22)
 
-A five-round keyless probe of ~230 endpoints from this Pi took the registry from
-76 to **90 sources**; adding optional Bluesky later brought the configured
-registry to 91. What was added:
+A five-round keyless probe of ~230 endpoints from this Pi first took the registry
+from 76 to 90 sources. Bluesky and the structured-evidence expansion later
+brought the configured registry to 101. What was added:
 
 - **patents lane (new)** — Google Patents `xhr/query`, best-effort.
 - **code** — SearXNG `packages` (crates.io, npm, Packagist, Hex, pkg.go.dev,
   pub.dev, lib.rs, Docker Hub in one call).
 - **news** — BleepingComputer, Krebs on Security, The Record, The Hacker News,
   SecurityWeek, Dark Reading, Cisco Security Advisories.
-- **security** — Red Hat CVE, Ubuntu CVE, SigmaHQ rules, MITRE CWE, MITRE CAPEC;
-  plus a working ExploitDB parser (it previously returned nothing).
+- **security** — Red Hat CVE, Ubuntu CVE, SigmaHQ rules, MITRE CWE, MITRE CAPEC,
+  GitHub Advisories and OpenSSF Scorecard; plus a working ExploitDB parser.
+- **academic** — direct Semantic Scholar and OpenReview adapters.
+- **code (structured)** — deps.dev package/version, provenance and repository
+  enrichment.
+- **osint lane (new)** — RDAP, PeeringDB, GLEIF, OFAC SDN and OFAC Consolidated.
+  OFAC bulk files are cached for 24 hours and require explicit sanctions intent.
 - **infra** — `http()` gained per-source `headers`; `xload()` gained malformed-XML
   tolerance; `_csv_rows()` was added.
 
-Full per-endpoint evidence, tiered candidates not yet wired in (public-data,
-infra-attribution, academic, community), and the confirmed-dead list live in
+Full per-endpoint evidence, remaining candidates (public-data,
+infra-attribution and community), and the confirmed-dead list live in
 `references/candidate-sources.md`.
 
 Re-verify with `bash scripts/verify_deep_research.sh`. It runs deterministic
@@ -348,8 +362,6 @@ that is correctly surfaced is reported as a live gap, not a parser failure.
 Verified failing keylessly from this Pi (2026-09-21):
 
 `html.duckduckgo.com` (JS challenge) · `reddit.com/*.json` (403) ·
-`api.semanticscholar.org` (429 under any spacing; *not* "always" - one 200 was
-observed, but it is not reliable standalone, and SearXNG `science` reaches it anyway) ·
 `index.commoncrawl.org` (504) ·
 `api.gdeltproject.org` (429 even at 1 req/5s) · `lobste.rs`, `dblp.org`,
 `www.mojeek.com` (bot walls) · `marginalia-search.com` (no keyless JSON API) ·

@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import pathlib
+import tempfile
 import unittest
 from unittest import mock
 
@@ -23,6 +24,32 @@ class QueryShapeTests(unittest.TestCase):
         query = deep_research.Q("1.1.1.1")
         self.assertEqual(query.ipv4, "1.1.1.1")
         self.assertIsNone(query.domain)
+
+    def test_ipv6_repo_and_package_shapes(self):
+        self.assertEqual(deep_research.Q("2001:4860:4860::8888").ip,
+                         "2001:4860:4860::8888")
+        self.assertEqual(
+            deep_research.Q("https://github.com/expressjs/express").repo,
+            "github.com/expressjs/express",
+        )
+        package = deep_research.Q("npm:@colors/colors@1.5.0").package
+        self.assertEqual(package, {
+            "ecosystem": "npm", "system": "NPM",
+            "name": "@colors/colors", "version": "1.5.0",
+        })
+
+
+class TransportTests(unittest.TestCase):
+    def test_bulk_feed_cache_avoids_second_network_call(self):
+        with tempfile.TemporaryDirectory() as cache_dir, \
+                mock.patch.dict("os.environ", {"DEEP_RESEARCH_CACHE": cache_dir}), \
+                mock.patch.object(deep_research, "http", return_value=("payload", None)) as fetch:
+            first = deep_research.cached_http("https://example.test/feed", max_age=60)
+            second = deep_research.cached_http("https://example.test/feed", max_age=60)
+
+        self.assertEqual(first, ("payload", None))
+        self.assertEqual(second, ("payload", None))
+        fetch.assert_called_once()
 
 
 class AutoRoutingTests(unittest.TestCase):
@@ -69,6 +96,21 @@ class AutoRoutingTests(unittest.TestCase):
         self.assertEqual(route["selected_lanes"], ["web", "academic"])
         self.assertNotIn("code", route["selected_lanes"])
         self.assertNotIn("security", route["selected_lanes"])
+
+    def test_network_identifiers_force_osint_without_jev(self):
+        with mock.patch.object(deep_research, "http") as mocked_http:
+            route = deep_research.auto_route("AS15169", api_key="test-key")
+
+        mocked_http.assert_not_called()
+        self.assertEqual(route["selected_lanes"], ["web", "security", "osint"])
+
+    def test_repo_forces_code_and_supply_chain_security(self):
+        route = deep_research.auto_route(
+            "https://github.com/expressjs/express", api_key="test-key"
+        )
+
+        self.assertEqual(route["selected_lanes"], ["web", "code", "security"])
+        self.assertEqual(route["reasons"]["code"], "repository identifier")
 
     def test_missing_key_uses_conservative_local_fallback(self):
         route = deep_research.auto_route("latest court ruling", api_key="")
@@ -117,6 +159,89 @@ class AutoRoutingTests(unittest.TestCase):
 
 
 class ParserTests(unittest.TestCase):
+    def test_github_advisory_and_deps_parsers(self):
+        advisory = [{
+            "ghsa_id": "GHSA-test-1234-5678",
+            "cve_id": "CVE-2024-1234",
+            "html_url": "https://github.com/advisories/GHSA-test-1234-5678",
+            "summary": "Example vulnerability",
+            "severity": "high",
+            "identifiers": [{"type": "CVE", "value": "CVE-2024-1234"}],
+            "vulnerabilities": [{
+                "package": {"ecosystem": "npm", "name": "example"},
+                "first_patched_version": {"identifier": "2.0.0"},
+            }],
+        }]
+        rows, _ = deep_research._github_advisory_parse(
+            json.dumps(advisory), "https://api.github.test", deep_research.Q("CVE-2024-1234"), 5
+        )
+        self.assertIn("CVE-2024-1234", rows[0][0])
+        self.assertIn("fixed=2.0.0", rows[0][1])
+
+        package = {
+            "packageKey": {"system": "NPM", "name": "express"},
+            "versions": [
+                {"versionKey": {"version": "4.0.0"}, "isDefault": False},
+                {"versionKey": {"version": "5.0.0"}, "isDefault": True},
+            ],
+        }
+        rows, _ = deep_research._deps_parse(
+            json.dumps(package), "https://deps.test", deep_research.Q("npm:express"), 5
+        )
+        self.assertIn("2 versions", rows[0][0])
+        self.assertIn("default=5.0.0", rows[0][1])
+
+    def test_scorecard_parser_labels_score_as_heuristic(self):
+        payload = {
+            "date": "2026-09-21T00:00:00Z",
+            "repo": {"name": "github.com/acme/widget"},
+            "score": 8.1,
+            "checks": [{"name": "Pinned-Dependencies", "score": 3,
+                        "reason": "dependencies not pinned", "documentation": {}}],
+        }
+        rows, _ = deep_research._scorecard_parse(
+            json.dumps(payload), "https://scorecard.test",
+            deep_research.Q("github:acme/widget"), 5,
+        )
+        self.assertIn("8.1/10", rows[0][0])
+        self.assertIn("not a vulnerability verdict", rows[0][1])
+
+    def test_rdap_gleif_and_ofac_parsers(self):
+        rdap = {
+            "objectClassName": "domain", "ldhName": "EXAMPLE.COM",
+            "status": ["active"],
+            "events": [{"eventAction": "registration", "eventDate": "1995-08-14T00:00:00Z"}],
+            "entities": [], "links": [],
+        }
+        rows, _ = deep_research._rdap_parse(
+            json.dumps(rdap), "https://rdap.test", deep_research.Q("example.com"), 5
+        )
+        self.assertIn("EXAMPLE.COM", rows[0][0])
+        self.assertIn("registered=1995-08-14", rows[0][1])
+
+        gleif = {"meta": {"pagination": {"total": 1}}, "data": [{
+            "id": "549300TESTTESTTEST12",
+            "attributes": {"lei": "549300TESTTESTTEST12", "entity": {
+                "legalName": {"name": "Acme Corp"}, "status": "ACTIVE",
+                "headquartersAddress": {"city": "Boston", "country": "US"},
+            }, "registration": {"status": "ISSUED"}},
+        }]}
+        rows, note = deep_research._gleif_parse(
+            json.dumps(gleif), "https://gleif.test", deep_research.Q("Acme Corp"), 5
+        )
+        self.assertIn("Acme Corp", rows[0][0])
+        self.assertIn("not proof", note)
+
+        xml = """<sdnList><sdnEntry><uid>1</uid><firstName>Jane</firstName>
+        <lastName>Example</lastName><sdnType>Individual</sdnType>
+        <programList><program>TEST</program></programList></sdnEntry></sdnList>"""
+        rows, note = deep_research._ofac_parse(
+            xml, "https://ofac.test", deep_research.Q("is Jane Example sanctioned by OFAC?"), 5
+        )
+        self.assertIn("Potential OFAC name match", rows[0][0])
+        self.assertIn("manual identity verification required", rows[0][1])
+        self.assertIn("does not establish", note)
+
     def test_openphish_only_returns_target_domain_matches(self):
         query = deep_research.Q("example.com")
         feed = "\n".join([
@@ -259,8 +384,8 @@ class ReportingTests(unittest.TestCase):
 
 
 class RegistryTests(unittest.TestCase):
-    def test_registry_has_91_configured_sources(self):
-        self.assertEqual(len(deep_research.S), 91)
+    def test_registry_has_101_configured_sources(self):
+        self.assertEqual(len(deep_research.S), 101)
         self.assertEqual(set(source["lane"] for source in deep_research.S),
                          set(deep_research.LANES))
         self.assertEqual(

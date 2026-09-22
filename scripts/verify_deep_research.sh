@@ -19,7 +19,7 @@ python3 -m py_compile "$S"; chkc "compiles" $?
 python3 -m unittest discover -s "$(dirname "$S")/../tests" >/tmp/v_unit.txt 2>&1
 chkc "deterministic unit tests" $?
 python3 "$S" --sources > /tmp/v_reg.txt 2>&1
-grep -q "91 configured sources across 10 lanes" /tmp/v_reg.txt; chkc "registry = 91 sources / 10 lanes" $?
+grep -q "101 configured sources across 11 lanes" /tmp/v_reg.txt; chkc "registry = 101 sources / 11 lanes" $?
 
 echo "=== positive control: residential proxy networks ==="
 python3 "$S" "residential proxy networks" --deep --limit 5 --no-unrelated > /tmp/v_pos.txt 2>/tmp/v_pos_err.txt

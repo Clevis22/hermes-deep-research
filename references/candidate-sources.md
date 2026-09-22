@@ -4,18 +4,20 @@ Method: one keyless request per endpoint, default Python UA, documented API path
 **Usable = HTTP 200 with a real payload.** Rate-limited endpoints were retried with
 spacing before being called dead.
 
-> **Wired in already (registry 91 sources / 10 lanes; 89 keyless):** Google Patents (patents lane),
+> **Wired in already (registry 101 sources / 11 lanes; 99 keyless):** Google Patents (patents lane),
 > SearXNG `packages`, the seven security-news feeds, and the security tier
 > (Red Hat CVE, Ubuntu CVE, SigmaHQ rules, MITRE CWE, MITRE CAPEC + a working
-> ExploitDB parser). **Everything else in this file is verified but NOT registered
-> yet** — add it with one `register(name, lane, build, kind, parse, ...)` call in the
+> ExploitDB parser), plus GitHub Advisories, deps.dev, OpenSSF Scorecard,
+> Semantic Scholar, OpenReview and the OSINT lane (RDAP, PeeringDB, GLEIF,
+> OFAC SDN and OFAC Consolidated). **Rows not marked as wired remain candidates** —
+> add them with one `register(name, lane, build, kind, parse, ...)` call in the
 > matching lane section. Do not re-add a row that is already wired (the registry is
 > the source of truth: `deep_research.py --sources`).
 > Re-run `scripts/verify_deep_research.sh` (23 checks) after any change.
 
-The registry is 91 sources. These are verified, not guessed.
+The registry is 101 sources. These are verified, not guessed.
 
-## Validated next additions (2026-09-22)
+## Validated structured additions (wired 2026-09-22)
 
 These are the best next integrations because they add structured evidence rather
 than another copy of ordinary web results. The first four were live-probed from
@@ -35,9 +37,9 @@ this host on 2026-09-22.
 | **P2** | **Brave Search API** | Key required; $5 monthly credit (about 1,000 Search calls), then $5/1,000 calls; payment card required | Independent web/news/image index. Attractive as an optional broad-search fallback, but less frictionless than Tavily. | `web` / `news` |
 | **P3** | **VirusTotal Public API** | Free community key; 4 requests/minute and 500/day | Useful exact hash, URL, domain and IP enrichment, but public-tier terms prohibit commercial products/workflows. Do not enable by default. | `security` |
 
-Recommended implementation order: GitHub Advisories, deps.dev, Scorecard, then
-direct Semantic Scholar/OpenReview. Those five improve evidence quality without
-making the default run depend on a credential. Add optional providers behind
+Implemented in this order: GitHub Advisories, deps.dev, Scorecard, then direct
+Semantic Scholar/OpenReview. Those five improve evidence quality without making
+the default run depend on a credential. Add optional providers behind
 environment variables and show them as `skipped_not_applicable` when the query is
 the wrong shape, not as coverage gaps.
 
@@ -51,19 +53,19 @@ host on 2026-09-22.
 
 | Priority | Source | Auth / cost | OSINT value and routing rule |
 |---|---|---|---|
-| **P0** | **RDAP.org** | Keyless; bootstrap service limits clients to 10 requests per 10 seconds | Domain, IP and ASN registration, status, dates and public entities. Replace ad-hoc WHOIS parsing; call only for exact domain/IP/ASN shapes. |
-| **P0** | **PeeringDB** | Keyless guest `GET` requests | ASN-to-network identity, peering policy, facilities, exchanges and interconnection points. Especially useful with RIPEstat and Shodan InternetDB. |
-| **P0** | **GLEIF API** | Keyless | Legal entities, LEIs, registered names/addresses, BIC/ISIN mappings and parent-child relationships. Use exact/fuzzy organization-name routing and label matches as registry evidence, not proof of current ownership. |
-| **P0** | **OFAC Sanctions List Service** | Keyless API and XML/CSV downloads | Primary US sanctions records, aliases, programs and identifiers. Prefer a cached daily file; require exact entity-shaped queries and prominently warn that name matches need human verification. |
+| **WIRED** | **RDAP.org** | Keyless; bootstrap service limits clients to 10 requests per 10 seconds | Domain, IP and ASN registration, status, dates and public entities. Exact shapes only. |
+| **WIRED** | **PeeringDB** | Keyless guest `GET` requests | ASN-to-network identity, peering policy, facilities, exchanges and interconnection points. |
+| **WIRED** | **GLEIF API** | Keyless | Legal entities, LEIs, registered names/addresses and status. Matches are registry evidence, not proof of current ownership. |
+| **WIRED** | **OFAC Sanctions List Service** | Keyless XML downloads | SDN and Consolidated aliases/programs; explicit sanctions queries only, daily cache, mandatory human-verification warning. |
 | **P1** | **RIPE Atlas** | Most public reads are keyless; free key/credits only for creating measurements | Public probes and historical ping, traceroute, DNS, TLS and HTTP measurement results. Geographic coordinates are deliberately obfuscated by 80-400 metres. Route only IP/domain/ASN investigations. |
 | **P1** | **UK Companies House** | Free registered key; 600 requests per 5 minutes | Live UK company profiles, officers, filing history and insolvency/charge data. Keep optional via `COMPANIES_HOUSE_API_KEY` and use for company names/numbers only. |
 | **P1** | **OpenSky Network** | Anonymous access: 400 credits/day per endpoint; free account: 4,000/day; non-commercial use | Live state vectors, tracks and flight records. Route exact ICAO24, callsign or bounded geographic queries; do not issue global requests for ordinary research terms. |
 | **P1** | **FAA Aircraft Registry** | Keyless daily bulk CSV (about 60 MB) | US N-number, make/model, registration and deregistration pivots. Cache locally once per day instead of downloading during each research run. |
 | **P2** | **OpenSanctions** | Keyless bulk data for non-commercial use under CC BY-NC 4.0; free hosted keys for qualifying public-interest work; commercial search/match is metered | Cross-jurisdiction sanctions, PEPs and corporate relationship data. Valuable but license-sensitive; keep disabled unless the deployment declares an eligible use or supplies a licensed key. |
-| **P2** | **WhatsMyName dataset** | Keyless CC BY-SA dataset; downstream checks hit 700+ third-party sites | Username-to-profile discovery. Make it an explicit, opt-in username mode with a small site allowlist, bounded concurrency and per-site rate/terms enforcement—never part of the default 91-source fan-out. |
+| **P2** | **WhatsMyName dataset** | Keyless CC BY-SA dataset; downstream checks hit 700+ third-party sites | Username-to-profile discovery. Make it an explicit, opt-in username mode with a small site allowlist, bounded concurrency and per-site rate/terms enforcement—never part of the default 101-source fan-out. |
 
-Implementation order for an OSINT lane: **RDAP + PeeringDB + GLEIF + OFAC** first,
-then RIPE Atlas. Together they provide complementary pivots without spraying the
+The initial OSINT lane is implemented as **RDAP + PeeringDB + GLEIF + OFAC**;
+RIPE Atlas remains next. Together they provide complementary pivots without spraying the
 same free-text query across hundreds of services. Every adapter should declare its
 accepted query shape and return `skipped_not_applicable` for everything else.
 

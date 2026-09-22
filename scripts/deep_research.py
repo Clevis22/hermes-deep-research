@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Route and fan out research across public sources reachable from this Pi.
 
-One query -> ~60 sources in parallel -> deduped, citable findings grouped by
-lane, with per-source coverage accounting (a source that failed is reported as
-a gap, never as "no results").
+One query -> up to 101 configured sources in parallel -> deduped, citable
+findings grouped by lane, with shape-aware skipping and per-source coverage
+accounting (a source that failed is reported as a gap, never as "no results").
 
 Stdlib only. Optional credentials are loaded from the environment or Hermes env file.
 
@@ -21,11 +21,15 @@ import argparse
 import concurrent.futures
 import csv
 import datetime as dt
+import difflib
+import hashlib
 import io
+import ipaddress
 import json
 import os
 import re
 import sys
+import threading
 import textwrap
 import time
 import urllib.error
@@ -46,7 +50,7 @@ BROWSER_UA = ("Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 
 LANES = ("web", "academic", "code", "community", "news", "regulatory",
-         "security", "reference", "archive", "patents")
+         "security", "osint", "reference", "archive", "patents")
 
 # Deep = every lane. Quick = the ones that answer most questions.
 QUICK_LANES = ("web", "academic", "community", "news", "reference")
@@ -78,6 +82,36 @@ def http(url, data=None, headers=None, timeout=TIMEOUT, retries=0, backoff=2.0):
             if attempt < retries:
                 time.sleep(backoff * (attempt + 1))
     return None, last
+
+
+def cached_http(url, headers=None, timeout=TIMEOUT, retries=0, max_age=0):
+    """Fetch a public bulk feed with a bounded on-disk cache."""
+    if not max_age:
+        return http(url, headers=headers, timeout=timeout, retries=retries)
+    cache_root = os.environ.get(
+        "DEEP_RESEARCH_CACHE",
+        os.path.join(os.path.expanduser("~"), ".cache", "hermes-deep-research"),
+    )
+    path = os.path.join(cache_root, hashlib.sha256(url.encode("utf-8")).hexdigest())
+    try:
+        if os.path.getsize(path) and time.time() - os.path.getmtime(path) <= max_age:
+            with open(path, encoding="utf-8", errors="replace") as handle:
+                return handle.read(), None
+    except OSError:
+        pass
+    text, err = http(url, headers=headers, timeout=timeout, retries=retries)
+    if err or text is None:
+        return text, err
+    try:
+        os.makedirs(cache_root, mode=0o700, exist_ok=True)
+        temporary = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+        with open(temporary, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    except OSError:
+        pass
+    return text, None
 
 
 def jload(text):
@@ -200,28 +234,89 @@ def rss_items(text, limit):
 # query classification
 # ---------------------------------------------------------------------------
 
+PACKAGE_SYSTEMS = {
+    "npm": "NPM",
+    "pypi": "PYPI",
+    "cargo": "CARGO",
+    "maven": "MAVEN",
+    "nuget": "NUGET",
+    "rubygems": "RUBYGEMS",
+    "go": "GO",
+}
+
+
+def _package_spec_from_text(raw):
+    """Parse explicit ``ecosystem:name[@version]`` package syntax."""
+    match = re.fullmatch(
+        r"(npm|pypi|cargo|maven|nuget|rubygems|go):(.+)", raw.strip(), re.I
+    )
+    if not match:
+        return None
+    ecosystem = match.group(1).lower()
+    remainder = match.group(2).strip()
+    if not remainder:
+        return None
+    version = None
+    split_at = remainder.rfind("@")
+    # A leading @ is part of a scoped npm package, not a version separator.
+    if split_at > 0:
+        remainder, version = remainder[:split_at], remainder[split_at + 1:] or None
+    return {
+        "ecosystem": ecosystem,
+        "system": PACKAGE_SYSTEMS[ecosystem],
+        "name": remainder,
+        "version": version,
+    }
+
+
+def _repo_from_text(raw):
+    """Return a deps.dev-style repository id for an explicit hosted repo."""
+    match = re.search(
+        r"(?:https?://)?(github\.com|gitlab\.com|bitbucket\.org)/"
+        r"([^/\s]+)/([^/#?\s]+)",
+        raw.strip(), re.I,
+    )
+    if not match:
+        shorthand = re.fullmatch(r"(github|gitlab|bitbucket):([^/\s]+)/([^/\s]+)",
+                                 raw.strip(), re.I)
+        if not shorthand:
+            return None
+        host = {"github": "github.com", "gitlab": "gitlab.com",
+                "bitbucket": "bitbucket.org"}[shorthand.group(1).lower()]
+        owner, repo = shorthand.group(2), shorthand.group(3)
+    else:
+        host, owner, repo = match.group(1).lower(), match.group(2), match.group(3)
+    return f"{host}/{owner}/{repo.removesuffix('.git')}"
+
+
+def _ip_literal(value):
+    try:
+        return str(ipaddress.ip_address(value.strip("[]")))
+    except ValueError:
+        return None
+
 class Q:
     def __init__(self, raw):
         self.raw = raw
         self.enc = urllib.parse.quote(raw)
         self.plus = urllib.parse.quote_plus(raw)
         self.cves = re.findall(r"CVE-\d{4}-\d{4,7}", raw, flags=re.I)
+        self.ghsas = re.findall(r"GHSA-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}",
+                               raw, flags=re.I)
         # CWE ids are their own namespace: CVE-2021-44228 must NOT be read as
         # CWE-44228, which is a 404. Only an explicit CWE-<n> maps.
         self.cwes = re.findall(r"CWE-(\d{1,5})", raw, flags=re.I)
         self.is_url = raw.startswith(("http://", "https://"))
         self.domain = None
         if self.is_url:
-            self.domain = raw.split("//", 1)[-1].split("/")[0]
+            self.domain = urllib.parse.urlparse(raw).hostname
         elif re.match(r"^[a-z0-9-]+(\.[a-z0-9-]+)+$", raw.strip(), flags=re.I):
             self.domain = raw.strip()
         stripped = raw.strip()
         host_value = self.domain or stripped
-        self.ipv4 = host_value if re.fullmatch(
-            r"(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}",
-            host_value,
-        ) else None
-        if self.ipv4:
+        self.ip = _ip_literal(host_value)
+        self.ipv4 = self.ip if self.ip and ":" not in self.ip else None
+        if self.ip:
             self.domain = None
         self.asn = stripped.upper() if re.fullmatch(r"AS\d+", stripped, re.I) else None
         self.hash = stripped.lower() if re.fullmatch(
@@ -230,9 +325,12 @@ class Q:
         self.doi = next(iter(re.findall(r"\b10\.\d{4,9}/\S+", raw, re.I)), None)
         self.arxiv = next(iter(re.findall(r"\b(?:arxiv:)?\d{4}\.\d{4,5}\b", raw, re.I)), None)
         self.nct = next(iter(re.findall(r"\bNCT\d{8}\b", raw, re.I)), None)
+        self.lei = stripped.upper() if re.fullmatch(r"[A-Z0-9]{18}[0-9]{2}", stripped, re.I) else None
         self.patent = next(iter(re.findall(
             r"\b(?:US|EP|WO|GB|JP|CN)\s*\d{5,}[A-Z]?\d?\b", raw, re.I
         )), None)
+        self.repo = _repo_from_text(raw)
+        self.package = _package_spec_from_text(raw)
         self.is_package = bool(re.match(r"^[@a-z0-9][\w.@/-]*$", raw.strip(), flags=re.I)) and " " not in raw
         # first token(s) that look like a product/vendor name for KEV-style match
         self.words = [w for w in re.split(r"\W+", re.sub(r"CVE-\d{4}-\d{4,7}", " ", raw, flags=re.I)) if len(w) > 3]
@@ -278,6 +376,11 @@ AUTO_LANE_QUESTIONS = {
         "malware, abuse, threat intelligence, defensive rules, certificates, domains, "
         "IP addresses, or network-security investigation?"
     ),
+    "osint": (
+        "Does `research_query` require structured open-source intelligence about an "
+        "internet resource, network operator, legal entity, ownership relationship, "
+        "or sanctions record? Do not select this lane for general background facts."
+    ),
     "reference": (
         "Is stable factual, encyclopedic, bibliographic, geographic, catalogue, or "
         "linked-data reference material a primary evidence type for `research_query`?"
@@ -300,6 +403,8 @@ FALLBACK_LANE_TERMS = {
     "regulatory": ("law", "regulation", "regulatory", "filing", "court", "lawsuit", "bill", "clinical trial"),
     "security": ("cve", "vulnerability", "exploit", "malware", "phishing", "breach",
                  "threat", "attack", "proxy", "botnet", "command and control"),
+    "osint": ("osint", "whois", "rdap", "asn", "network operator", "legal entity",
+              "lei", "ownership", "parent company", "sanction", "ofac", "sdn"),
     "reference": ("what is", "who is", "where is", "definition", "overview", "history"),
     "archive": ("archive", "archived", "historical website", "old website", "wayback"),
     "patents": ("patent", "invention", "inventor", "prior art"),
@@ -311,16 +416,23 @@ def hard_route_lanes(q):
     forced = {"web"}
     reasons = {"web": "baseline discovery"}
 
-    if q.cves or q.cwes or q.hash or q.ipv4 or q.asn:
+    if q.cves or q.ghsas or q.cwes or q.hash or q.ip or q.asn:
         forced.add("security")
         reasons["security"] = "exact security/network identifier"
-    if q.domain:
-        forced.update(("security", "archive", "reference"))
+    if q.domain and not q.repo:
+        forced.update(("security", "osint", "archive", "reference"))
         reasons.update({
             "security": "domain or URL pivot",
+            "osint": "domain registration pivot",
             "archive": "domain or URL history",
             "reference": "domain or URL context",
         })
+    if q.ip or q.asn:
+        forced.add("osint")
+        reasons["osint"] = "IP or ASN registration and network pivot"
+    if q.lei:
+        forced.add("osint")
+        reasons["osint"] = "legal-entity identifier"
     if q.doi or q.arxiv:
         forced.add("academic")
         reasons["academic"] = "exact scholarly identifier"
@@ -333,7 +445,17 @@ def hard_route_lanes(q):
 
     low = q.raw.lower()
     package_words = ("package", "npm", "pypi", "crate", "maven", "rubygems", "nuget")
-    explicit_identifier = q.doi or q.arxiv or q.nct or q.patent
+    if q.repo:
+        forced.update(("code", "security"))
+        reasons["code"] = "repository identifier"
+        reasons.setdefault("security", "repository supply-chain posture")
+    if q.package:
+        forced.update(("code", "security"))
+        reasons["code"] = "explicit package identifier"
+        reasons.setdefault("security", "package vulnerability enrichment")
+
+    explicit_identifier = (q.doi or q.arxiv or q.nct or q.patent or q.lei
+                           or q.repo or q.package)
     if (not explicit_identifier and any(word in low for word in package_words)) or (
             not explicit_identifier and q.is_package
             and (q.raw.startswith("@") or "/" in q.raw)):
@@ -346,11 +468,12 @@ def hard_route_lanes(q):
 def is_exact_identifier_query(q):
     """True when local syntax supplies the complete routing decision."""
     stripped = q.raw.strip()
-    if q.domain or q.is_url or q.ipv4 or q.asn or q.hash:
+    if q.domain or q.is_url or q.ip or q.asn or q.hash or q.lei or q.repo or q.package:
         return True
     exact_patterns = (
         r"CVE-\d{4}-\d{4,7}",
         r"CWE-\d{1,5}",
+        r"GHSA-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}",
         r"(?:doi:\s*)?10\.\d{4,9}/\S+",
         r"(?:arxiv:)?\d{4}\.\d{4,5}",
         r"NCT\d{8}",
@@ -553,11 +676,11 @@ S = []  # registry
 
 
 def register(name, lane, build, kind, parse, timeout=TIMEOUT, retries=0, limit_multiplier=1,
-             headers=None, credential=None):
+             headers=None, credential=None, cache_ttl=0):
     S.append({"name": name, "lane": lane, "build": build, "kind": kind,
               "parse": parse, "timeout": timeout, "retries": retries,
               "limit_multiplier": limit_multiplier, "headers": headers,
-              "credential": credential})
+              "credential": credential, "cache_ttl": cache_ttl})
 
 
 # --- WEB -------------------------------------------------------------------
@@ -751,9 +874,76 @@ register("HF Papers", "academic",
                               for p in (jload(t) or [])[:l]], None))
 
 
+def _semantic_scholar_headers():
+    key = _dotenv_value("SEMANTIC_SCHOLAR_API_KEY")
+    return {"x-api-key": key} if key else None
+
+
+def _semantic_scholar_parse(text, url, q, limit):
+    body = jload(text) or {}
+    if body.get("message"):
+        return [], str(body["message"])
+    rows = []
+    for paper in (body.get("data") or [])[:limit]:
+        authors = ", ".join(a.get("name", "") for a in (paper.get("authors") or [])[:2])
+        ext = paper.get("externalIds") or {}
+        link = paper.get("url")
+        if ext.get("DOI"):
+            link = f"https://doi.org/{ext['DOI']}"
+        rows.append((clip(paper.get("title"), 150),
+                     clip(f"{paper.get('year') or ''} {authors} "
+                          f"cites={paper.get('citationCount', '?')}", 90),
+                     link or url))
+    return rows, None
+
+
+register("Semantic Scholar", "academic",
+         lambda q: ("https://api.semanticscholar.org/graph/v1/paper/search?"
+                    f"query={q.enc}&limit=6&fields=title,year,url,authors,citationCount,externalIds"),
+         "json", _semantic_scholar_parse, retries=1,
+         headers=_semantic_scholar_headers)
+
+
+def _openreview_value(content, key, default=""):
+    value = (content or {}).get(key, default)
+    return value.get("value", default) if isinstance(value, dict) else value
+
+
+def _openreview_parse(text, url, q, limit):
+    rows = []
+    for note in (dig(jload(text), "notes", []) or [])[:limit]:
+        content = note.get("content") or {}
+        title = _openreview_value(content, "title")
+        if not title:
+            # Public search also indexes imported bibliographic records whose
+            # title is recoverable from the BibTeX payload.
+            bibtex = str(_openreview_value(content, "_bibtex"))
+            match = re.search(r"\btitle\s*=\s*[\{\"](.+?)[\}\"]\s*,?\n", bibtex, re.I | re.S)
+            title = match.group(1).replace("\n", " ") if match else ""
+        if not title:
+            continue
+        authors = _openreview_value(content, "authors", []) or []
+        if isinstance(authors, str):
+            authors = [authors]
+        venue = _openreview_value(content, "venue") or _openreview_value(content, "venueid")
+        link = _openreview_value(content, "html")
+        if not link and note.get("id"):
+            link = f"https://openreview.net/forum?id={note['id']}"
+        rows.append((clip(title, 150),
+                     clip(f"{venue or ''} {', '.join(authors[:2])}", 90),
+                     link or url))
+    return rows, None
+
+
+register("OpenReview", "academic",
+         lambda q: f"https://api2.openreview.net/notes/search?term={q.enc}&limit=6",
+         "json", _openreview_parse, retries=1)
+
+
 # --- CODE ------------------------------------------------------------------
 register("GitHub repos", "code",
-         lambda q: f"https://api.github.com/search/repositories?q={q.enc}&per_page=6&sort=stars",
+         lambda q: (f"https://api.github.com/search/repositories?q={q.enc}&per_page=6&sort=stars"
+                    if not (q.package or q.repo) else None),
          "json",
          lambda t, u, q, l: ([(f"{dig(r, 'full_name')} ★{dig(r, 'stargazers_count')}",
                                clip(f"{dig(r, 'language')} {clip(dig(r, 'description'), 90)}", 110),
@@ -761,6 +951,56 @@ register("GitHub repos", "code",
                               for r in (dig(jload(t), "items", []) or [])[:l]],
                              ("GitHub unauthenticated search is rate-limited to ~10 req/min"
                               if dig(jload(t), "message") else None)))
+
+
+def _deps_build(q):
+    if q.package:
+        spec = q.package
+        name = urllib.parse.quote(spec["name"], safe="")
+        base = f"https://api.deps.dev/v3/systems/{spec['system']}/packages/{name}"
+        if spec.get("version"):
+            return base + "/versions/" + urllib.parse.quote(spec["version"], safe="")
+        return base
+    if q.repo:
+        return "https://api.deps.dev/v3/projects/" + urllib.parse.quote(q.repo, safe="")
+    return None
+
+
+def _deps_parse(text, url, q, limit):
+    body = jload(text) or {}
+    if body.get("projectKey"):
+        project = dig(body, "projectKey.id") or q.repo
+        score = dig(body, "scorecard.overallScore")
+        meta = (f"stars={body.get('starsCount', '?')} forks={body.get('forksCount', '?')} "
+                f"license={body.get('license') or '?'}")
+        if score is not None:
+            meta += f" scorecard={score}/10"
+        return [(clip(f"deps.dev project: {project}", 150), clip(meta, 120),
+                 body.get("homepage") or url)], None
+
+    package = body.get("packageKey") or body.get("versionKey") or {}
+    if not package:
+        return [], body.get("message")
+    system, name = package.get("system"), package.get("name")
+    versions = body.get("versions")
+    if versions is not None:
+        default = next((dig(v, "versionKey.version") for v in versions if v.get("isDefault")), None)
+        deprecated = sum(1 for v in versions if v.get("isDeprecated"))
+        return [(f"deps.dev {system}:{name}: {len(versions)} versions",
+                 clip(f"default={default or '?'} deprecated={deprecated}", 100), url)], None
+
+    version = package.get("version")
+    advisories = [dig(a, "id") for a in (body.get("advisoryKeys") or []) if dig(a, "id")]
+    licenses = ", ".join(body.get("licenses") or []) or "unknown"
+    verified = sum(1 for a in (body.get("attestations") or []) if a.get("verified"))
+    meta = f"licenses={licenses} advisories={len(advisories)} verified-attestations={verified}"
+    rows = [(clip(f"deps.dev {system}:{name}@{version}", 150), clip(meta, 140), url)]
+    rows.extend((f"{advisory} affects {name}@{version}", "deps.dev / OSV advisory",
+                 f"https://osv.dev/vulnerability/{advisory}") for advisory in advisories[:max(0, limit - 1)])
+    return rows[:limit], None
+
+
+register("deps.dev", "code", _deps_build, "json", _deps_parse, timeout=25)
 
 def _github_code_build(q):
     # GitHub's code-search API requires authentication. Without a token this
@@ -784,7 +1024,8 @@ register("GitHub code", "code", _github_code_build,
          headers=_github_code_headers, credential="GITHUB_TOKEN")
 
 register("GitLab", "code",
-         lambda q: f"https://gitlab.com/api/v4/projects?search={q.enc}&per_page=6&order_by=star_count",
+         lambda q: (f"https://gitlab.com/api/v4/projects?search={q.enc}&per_page=6&order_by=star_count"
+                    if not (q.package or q.repo) else None),
          "json",
          lambda t, u, q, l: ([(clip(dig(p, "path_with_namespace"), 120),
                                clip(f"★{dig(p, 'star_count')} {clip(dig(p, 'description'), 80)}", 110),
@@ -792,14 +1033,19 @@ register("GitLab", "code",
                               for p in (jload(t) or [])[:l]], None))
 
 register("Codeberg", "code",
-         lambda q: f"https://codeberg.org/api/v1/repos/search?q={q.enc}&limit=6",
+         lambda q: (f"https://codeberg.org/api/v1/repos/search?q={q.enc}&limit=6"
+                    if not (q.package or q.repo) else None),
          "json",
          lambda t, u, q, l: ([(clip(dig(r, "full_name"), 120), clip(f"★{dig(r, 'stars_count')}", 40),
                                dig(r, "html_url") or u)
                               for r in (dig(jload(t), "data", []) or [])[:l]], None))
 
 register("npm", "code",
-         lambda q: f"https://registry.npmjs.org/-/v1/search?text={q.enc}&size=6",
+         lambda q: ("https://registry.npmjs.org/-/v1/search?text="
+                    + urllib.parse.quote(q.package["name"]) + "&size=6")
+                   if q.package and q.package["system"] == "NPM"
+                   else (f"https://registry.npmjs.org/-/v1/search?text={q.enc}&size=6"
+                         if not q.package and not q.repo else None),
          "json",
          lambda t, u, q, l: ([(f"{dig(o, 'package.name')}@{dig(o, 'package.version')}",
                                clip(clip(dig(o, "package.description"), 90), 110),
@@ -807,42 +1053,56 @@ register("npm", "code",
                               for o in (dig(jload(t), "objects", []) or [])[:l]], None))
 
 register("crates.io", "code",
-         lambda q: f"https://crates.io/api/v1/crates?q={q.enc}&per_page=6",
+         lambda q: ("https://crates.io/api/v1/crates?q="
+                    + urllib.parse.quote(q.package["name"]) + "&per_page=6")
+                   if q.package and q.package["system"] == "CARGO"
+                   else (f"https://crates.io/api/v1/crates?q={q.enc}&per_page=6"
+                         if not q.package and not q.repo else None),
          "json",
          lambda t, u, q, l: ([(clip(dig(c, "name"), 100), clip(dig(c, "description"), 100),
                                f"https://crates.io/crates/{dig(c, 'name')}")
                               for c in (dig(jload(t), "crates", []) or [])[:l]], None))
 
 register("Packagist", "code",
-         lambda q: f"https://packagist.org/search.json?q={q.enc}&per_page=6",
+         lambda q: (f"https://packagist.org/search.json?q={q.enc}&per_page=6"
+                    if not (q.package or q.repo) else None),
          "json",
          lambda t, u, q, l: ([(clip(dig(r, "name"), 100), clip(dig(r, "description"), 100),
                                dig(r, "repository") or f"https://packagist.org/packages/{dig(r, 'name')}")
                               for r in (dig(jload(t), "results", []) or [])[:l]], None))
 
 register("Maven", "code",
-         lambda q: f"https://search.maven.org/solrsearch/select?q={q.enc}&rows=6&wt=json",
+         lambda q: ("https://search.maven.org/solrsearch/select?q="
+                    + urllib.parse.quote(q.package["name"]) + "&rows=6&wt=json")
+                   if q.package and q.package["system"] == "MAVEN"
+                   else (f"https://search.maven.org/solrsearch/select?q={q.enc}&rows=6&wt=json"
+                         if not q.package and not q.repo else None),
          "json",
          lambda t, u, q, l: ([(f"{dig(d, 'g')}:{dig(d, 'a')}", clip(str(dig(d, 'latestVersion')), 40),
                                f"https://search.maven.org/artifact/{dig(d, 'g')}/{dig(d, 'a')}")
                               for d in (dig(jload(t), "response.docs", []) or [])[:l]], None))
 
 register("Docker Hub", "code",
-         lambda q: f"https://hub.docker.com/v2/search/repositories/?query={q.enc}&page_size=6",
+         lambda q: (f"https://hub.docker.com/v2/search/repositories/?query={q.enc}&page_size=6"
+                    if not (q.package or q.repo) else None),
          "json",
          lambda t, u, q, l: ([(clip(dig(r, "repo_name"), 100), clip(f"★{dig(r, 'star_count')} pulls={dig(r, 'pull_count')}", 60),
                                f"https://hub.docker.com/r/{dig(r, 'repo_name')}")
                               for r in (dig(jload(t), "results", []) or [])[:l]], None))
 
 register("HuggingFace models", "code",
-         lambda q: f"https://huggingface.co/api/models?search={q.enc}&limit=6&sort=downloads",
+         lambda q: (f"https://huggingface.co/api/models?search={q.enc}&limit=6&sort=downloads"
+                    if not (q.package or q.repo) else None),
          "json",
          lambda t, u, q, l: ([(clip(dig(m, "id"), 110), clip(f"downloads={dig(m, 'downloads')} likes={dig(m, 'likes')}", 60),
                                f"https://huggingface.co/{dig(m, 'id')}")
                               for m in (jload(t) or [])[:l]], None))
 
 register("Software Heritage", "code",
-         lambda q: f"https://archive.softwareheritage.org/api/1/origin/search/{q.enc}/?limit=6",
+         lambda q: ("https://archive.softwareheritage.org/api/1/origin/search/"
+                    + urllib.parse.quote("https://" + q.repo, safe="") + "/?limit=6")
+                   if q.repo else (f"https://archive.softwareheritage.org/api/1/origin/search/{q.enc}/?limit=6"
+                                   if not q.package else None),
          "json",
          lambda t, u, q, l: ([(clip(dig(o, "url"), 130), "", dig(o, "url") or u)
                               for o in (jload(t) or [])[:l]], None))
@@ -1110,13 +1370,16 @@ def _kev_parse(t, u, q, l):
 
 
 register("CISA KEV", "security",
-         lambda q: "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json",
+         lambda q: ("https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+                    if not (q.package or q.repo) else None),
          "json", _kev_parse, timeout=30, retries=1)
 
 
 def _nvd(q):
     if q.cves:
         return f"https://services.nvd.nist.gov/rest/json/cves/2.0?cveId={q.cves[0].upper()}"
+    if q.package or q.repo:
+        return None
     return ("https://services.nvd.nist.gov/rest/json/cves/2.0?resultsPerPage=6"
             f"&keywordSearch={q.enc}")
 
@@ -1160,9 +1423,87 @@ register("OSV", "security",
                                     f"{dig(jload(t), 'summary') or '(advisory record, no summary)'}", 160),
                                clip(str(dig(jload(t), "published", "")), 40), u)], None))
 
+
+def _github_advisory_build(q):
+    base = "https://api.github.com/advisories"
+    if q.ghsas:
+        return f"{base}/{q.ghsas[0].upper()}"
+    if q.cves:
+        return f"{base}?cve_id={q.cves[0].upper()}&per_page=6"
+    if q.package:
+        affected = q.package["name"]
+        if q.package.get("version"):
+            affected += "@" + q.package["version"]
+        return f"{base}?affects={urllib.parse.quote(affected, safe='')}&per_page=6"
+    return None
+
+
+def _github_advisory_parse(text, url, q, limit):
+    body = jload(text)
+    advisories = body if isinstance(body, list) else [body] if isinstance(body, dict) else []
+    rows = []
+    for advisory in advisories[:limit]:
+        if not advisory or advisory.get("message"):
+            continue
+        affected = []
+        for vuln in (advisory.get("vulnerabilities") or [])[:3]:
+            package = dig(vuln, "package.name")
+            ecosystem = dig(vuln, "package.ecosystem")
+            patched = vuln.get("first_patched_version")
+            fixed = (patched.get("identifier") if isinstance(patched, dict)
+                     else patched) or "unfixed"
+            if package:
+                affected.append(f"{ecosystem}:{package} fixed={fixed}")
+        identifiers = "/".join(
+            str(i.get("value")) for i in (advisory.get("identifiers") or [])[:2]
+            if i.get("value")
+        )
+        rows.append((clip(f"{identifiers or advisory.get('ghsa_id')} "
+                          f"{advisory.get('summary') or ''}", 160),
+                     clip(f"severity={advisory.get('severity') or '?'} "
+                          f"{' ; '.join(affected)}", 160),
+                     advisory.get("html_url") or url))
+    note = body.get("message") if isinstance(body, dict) and body.get("message") else None
+    return rows, note
+
+
+register("GitHub Advisories", "security", _github_advisory_build,
+         "json", _github_advisory_parse,
+         headers={"Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28"})
+
+
+def _scorecard_build(q):
+    if not q.repo or not q.repo.lower().startswith("github.com/"):
+        return None
+    return "https://api.securityscorecards.dev/projects/" + q.repo
+
+
+def _scorecard_parse(text, url, q, limit):
+    body = jload(text) or {}
+    if body.get("error") or body.get("message"):
+        return [], body.get("error") or body.get("message")
+    repo = dig(body, "repo.name") or q.repo
+    score = body.get("score")
+    date = str(body.get("date") or "")[:10]
+    rows = [(f"OpenSSF Scorecard {repo}: {score}/10",
+             f"measured {date}; heuristic supply-chain signal, not a vulnerability verdict",
+             f"https://scorecard.dev/viewer/?uri={urllib.parse.quote(repo or '', safe='')}")]
+    checks = [c for c in (body.get("checks") or []) if isinstance(c.get("score"), (int, float))]
+    for check in sorted(checks, key=lambda item: item["score"])[:max(0, limit - 1)]:
+        rows.append((f"Scorecard {check.get('name')}: {check.get('score')}/10",
+                     clip(check.get("reason") or "", 120),
+                     dig(check, "documentation.url") or url))
+    return rows[:limit], None
+
+
+register("OpenSSF Scorecard", "security", _scorecard_build,
+         "json", _scorecard_parse, timeout=25)
+
 register("CertSpotter CT", "security",
          lambda q: (f"https://api.certspotter.com/v1/issuances?domain={q.domain}"
-                    "&include_subdomains=true&expand=dns_names") if q.domain else None,
+                    "&include_subdomains=true&expand=dns_names")
+                   if q.domain and not q.repo else None,
          "json",
          lambda t, u, q, l: ([(
              f"CT: {len(jload(t) or [])} certificates for {q.domain}",
@@ -1177,15 +1518,16 @@ register("Shodan InternetDB", "security",
                                u)], None))
 
 register("RIPEstat", "security",
-         lambda q: (f"https://stat.ripe.net/data/prefix-overview/data.json?resource={q.raw.strip()}"
-                    if re.match(r"^\d+\.\d+\.\d+\.\d+$|^AS\d+$", q.raw.strip(), re.I) else None),
+         lambda q: ("https://stat.ripe.net/data/prefix-overview/data.json?resource="
+                    + urllib.parse.quote(q.ip or q.asn)) if (q.ip or q.asn) else None,
          "json",
          lambda t, u, q, l: ([(f"RIPEstat {dig(jload(t), 'data.resource')}: "
                                f"{len(dig(jload(t), 'data.asns', []) or [])} origin ASN(s)",
                                clip(f"abuse contacts {dig(jload(t), 'data.abuse_contacts')}", 120), u)], None))
 
 register("AlienVault OTX", "security",
-         lambda q: f"https://otx.alienvault.com/api/v1/indicators/domain/{q.domain}/general" if q.domain else None,
+         lambda q: (f"https://otx.alienvault.com/api/v1/indicators/domain/{q.domain}/general"
+                    if q.domain and not q.repo else None),
          "json",
          lambda t, u, q, l: ([(f"OTX {q.domain}: {dig(jload(t), 'pulse_info.count')} threat pulses",
                                clip(f"reputation={dig(jload(t), 'reputation')} "
@@ -1194,7 +1536,7 @@ register("AlienVault OTX", "security",
 
 def _openphish_build(q):
     """The bulk feed is useful only when there is a concrete domain to match."""
-    return "https://openphish.com/feed.txt" if q.domain else None
+    return "https://openphish.com/feed.txt" if q.domain and not q.repo else None
 
 
 def _openphish_parse(text, _url, q, limit):
@@ -1218,7 +1560,8 @@ def _openphish_parse(text, _url, q, limit):
 register("OpenPhish feed", "security", _openphish_build, "text", _openphish_parse)
 
 register("ExploitDB", "security",
-         lambda q: "https://gitlab.com/exploit-database/exploitdb/-/raw/main/files_exploits.csv",
+         lambda q: ("https://gitlab.com/exploit-database/exploitdb/-/raw/main/files_exploits.csv"
+                    if not (q.package or q.repo) else None),
          "text", lambda t, u, q, l: ([(clip(r[2], 150),
                                        clip(f"{r[5]}/{r[6]} {r[3]}", 60),
                                        f"https://www.exploit-db.com/exploits/{r[0]}")
@@ -1274,7 +1617,7 @@ register("Red Hat CVE", "security", _redhat_build, "json", _redhat_parse)
 register("Ubuntu CVE", "security",
          lambda q: ("https://ubuntu.com/security/cves.json?q="
                     + urllib.parse.quote(q.cves[0] if q.cves else q.raw.strip())
-                    + "&limit=6"),
+                    + "&limit=6") if not (q.package or q.repo) else None,
          "json",
          lambda t, u, q, l: ([(clip(f"{dig(it, 'id')} {dig(it, 'priority') or ''}", 70),
                                clip(f"{dig(it, 'published', '')[:10]} "
@@ -1303,8 +1646,8 @@ def _sigma_rows(text, q, limit):
 
 
 register("SigmaHQ rules", "security",
-         lambda q: ("https://raw.githubusercontent.com/SigmaHQ/sigma/master/"
-                    "tests/thor.yml"),
+         lambda q: (("https://raw.githubusercontent.com/SigmaHQ/sigma/master/"
+                     "tests/thor.yml") if not (q.package or q.repo) else None),
          "text",
          lambda t, u, q, l: (_sigma_rows(t, q, l), None),
          timeout=25)
@@ -1342,6 +1685,196 @@ register("MITRE CWE", "security",
                               for it in ((jload(t) or {}).get("Weaknesses") or [])[:l]],
                              None),
          timeout=25)
+
+
+# --- OSINT -----------------------------------------------------------------
+# These adapters are deliberately shape-gated. Infrastructure registration,
+# corporate identity and sanctions data are valuable pivots, but spraying a
+# generic free-text query across them would create false confidence and noise.
+def _rdap_build(q):
+    if q.domain and not q.repo:
+        return f"https://rdap.org/domain/{urllib.parse.quote(q.domain, safe='')}"
+    if q.ip:
+        return f"https://rdap.org/ip/{urllib.parse.quote(q.ip, safe=':')}"
+    if q.asn:
+        return f"https://rdap.org/autnum/{q.asn[2:]}"
+    return None
+
+
+def _rdap_vcard_name(entity):
+    card = entity.get("vcardArray") or []
+    rows = card[1] if len(card) > 1 and isinstance(card[1], list) else []
+    return next((str(row[3]) for row in rows
+                 if len(row) > 3 and row[0] == "fn" and row[3]), "")
+
+
+def _rdap_parse(text, url, q, limit):
+    body = jload(text) or {}
+    if body.get("errorCode"):
+        return [], body.get("title") or body.get("description")
+    label = body.get("ldhName") or body.get("name") or body.get("handle") or q.raw
+    registrars = [_rdap_vcard_name(e) for e in (body.get("entities") or [])
+                  if "registrar" in (e.get("roles") or [])]
+    events = {e.get("eventAction"): str(e.get("eventDate") or "")[:10]
+              for e in (body.get("events") or []) if e.get("eventAction")}
+    status = ", ".join(body.get("status") or [])
+    meta = " ".join(x for x in (
+        f"registrar={registrars[0]}" if registrars else "",
+        f"registered={events.get('registration')}" if events.get("registration") else "",
+        f"changed={events.get('last changed')}" if events.get("last changed") else "",
+        f"status={status}" if status else "",
+    ) if x)
+    self_link = next((link.get("href") for link in (body.get("links") or [])
+                      if link.get("rel") == "self" and link.get("href")), url)
+    return [(clip(f"RDAP {body.get('objectClassName', 'resource')}: {label}", 150),
+             clip(meta, 180), self_link)], None
+
+
+register("RDAP", "osint", _rdap_build, "json", _rdap_parse,
+         timeout=25, retries=1)
+
+
+def _peeringdb_parse(text, url, q, limit):
+    rows = []
+    for network in (dig(jload(text), "data", []) or [])[:limit]:
+        rows.append((clip(f"AS{network.get('asn')} {network.get('name')}", 150),
+                     clip(f"type={network.get('info_type') or '?'} "
+                          f"scope={network.get('info_scope') or '?'} "
+                          f"peering={network.get('policy_general') or '?'} "
+                          f"exchanges={network.get('ix_count', '?')} "
+                          f"facilities={network.get('fac_count', '?')}", 150),
+                     network.get("website") or url))
+    return rows, None
+
+
+register("PeeringDB", "osint",
+         lambda q: ("https://www.peeringdb.com/api/net?asn=" + q.asn[2:] + "&depth=1")
+                   if q.asn else None,
+         "json", _peeringdb_parse, timeout=25)
+
+
+def _gleif_build(q):
+    if q.lei:
+        return f"https://api.gleif.org/api/v1/lei-records/{q.lei}"
+    if any(term in q.raw.lower() for term in ("ofac", "sanction", "sdn")):
+        return None
+    if any((q.domain, q.ip, q.asn, q.hash, q.repo, q.package, q.cves, q.ghsas,
+            q.doi, q.arxiv, q.nct, q.patent)):
+        return None
+    candidate = q.raw.strip()
+    if len(candidate) < 3:
+        return None
+    return ("https://api.gleif.org/api/v1/lei-records?"
+            f"filter%5Bentity.legalName%5D={urllib.parse.quote(candidate)}&page%5Bsize%5D=6")
+
+
+def _gleif_parse(text, url, q, limit):
+    body = jload(text) or {}
+    data = body.get("data")
+    records = data if isinstance(data, list) else [data] if isinstance(data, dict) else []
+    rows = []
+    for record in records[:limit]:
+        attrs = record.get("attributes") or {}
+        lei = attrs.get("lei") or record.get("id")
+        entity = attrs.get("entity") or {}
+        registration = attrs.get("registration") or {}
+        name = dig(entity, "legalName.name") or lei
+        address = entity.get("headquartersAddress") or entity.get("legalAddress") or {}
+        location = ", ".join(x for x in (address.get("city"), address.get("region"),
+                                          address.get("country")) if x)
+        rows.append((clip(f"GLEIF {name} ({lei})", 150),
+                     clip(f"entity={entity.get('status') or '?'} "
+                          f"registration={registration.get('status') or '?'} {location}", 140),
+                     f"https://search.gleif.org/#/record/{lei}"))
+    total = dig(body, "meta.pagination.total")
+    return rows, (f"{total} legal-entity records matched; registry evidence is not "
+                  "proof of current ownership" if total is not None else None)
+
+
+register("GLEIF", "osint", _gleif_build, "json", _gleif_parse,
+         timeout=25, retries=1)
+
+
+_OFAC_STOP = {
+    "a", "about", "against", "an", "and", "are", "by", "check", "company",
+    "entity", "find", "for", "investigate", "investigation", "is", "list", "listed",
+    "lookup", "ofac", "on", "person", "sanction", "sanctioned", "sanctions", "sdn",
+    "search", "status", "the", "whether",
+}
+
+
+def _ofac_terms(q):
+    words = [w.lower() for w in re.findall(r"[a-z0-9]+", q.raw, re.I)]
+    return [word for word in words if word not in _OFAC_STOP and len(word) > 1]
+
+
+def _ofac_build(kind):
+    def build(q):
+        low = q.raw.lower()
+        if not any(term in low for term in ("ofac", "sanction", "sdn")) or not _ofac_terms(q):
+            return None
+        return ("https://sanctionslistservice.ofac.treas.gov/api/PublicationPreview/exports/"
+                f"{kind}.XML")
+    return build
+
+
+def _xml_child_text(element, name):
+    child = element.find(f"{{*}}{name}")
+    if child is None:
+        child = element.find(name)
+    return (child.text or "").strip() if child is not None else ""
+
+
+def _ofac_name(element):
+    return " ".join(x for x in (_xml_child_text(element, "firstName"),
+                                 _xml_child_text(element, "lastName")) if x)
+
+
+def _ofac_parse(text, url, q, limit):
+    root = xload(text)
+    if root is None:
+        return [], "OFAC returned malformed XML"
+    target_terms = _ofac_terms(q)
+    target = " ".join(target_terms)
+    matches = []
+    entries = root.findall(".//{*}sdnEntry") or root.findall(".//sdnEntry")
+    for entry in entries:
+        primary = _ofac_name(entry)
+        aliases = [_ofac_name(alias) for alias in
+                   (entry.findall(".//{*}aka") or entry.findall(".//aka"))]
+        names = [name for name in [primary, *aliases] if name]
+        if not names:
+            continue
+        score = 0.0
+        for name in names:
+            normalized = " ".join(re.findall(r"[a-z0-9]+", name.lower()))
+            candidate_terms = set(normalized.split())
+            if target_terms and all(term in candidate_terms for term in target_terms):
+                score = max(score, 1.0)
+            score = max(score, difflib.SequenceMatcher(None, target, normalized).ratio())
+        if score < 0.82:
+            continue
+        programs = [_xml_child_text(node, "program") or (node.text or "").strip()
+                    for node in (entry.findall(".//{*}program") or entry.findall(".//program"))]
+        uid = _xml_child_text(entry, "uid")
+        matches.append((score, primary, _xml_child_text(entry, "sdnType"),
+                        [p for p in programs if p], uid))
+    matches.sort(reverse=True, key=lambda item: item[0])
+    rows = [(clip(f"Potential OFAC name match: {name}", 150),
+             clip(f"similarity={score:.2f} type={kind or '?'} programs={','.join(programs)}; "
+                  "manual identity verification required", 180),
+             "https://sanctionslist.ofac.treas.gov/Home/index.html")
+            for score, name, kind, programs, _uid in matches[:limit]]
+    note = (f"{len(matches)} potential name matches; a name match alone does not establish "
+            "that the subject is sanctioned" if matches else
+            "no potential name match; this is not sanctions clearance")
+    return rows, note
+
+
+for _name, _kind in (("OFAC SDN", "SDN"), ("OFAC Consolidated", "CONSOLIDATED")):
+    register(_name, "osint", _ofac_build(_kind), "xml", _ofac_parse,
+             timeout=75, retries=1, headers={"User-Agent": BROWSER_UA},
+             cache_ttl=24 * 60 * 60)
 
 
 # --- PATENTS ---------------------------------------------------------------
@@ -1569,8 +2102,8 @@ def run_one(src, q, limit):
             hdrs = hdrs()
         except Exception:  # noqa: BLE001
             hdrs = None
-    text, err = http(url, timeout=src["timeout"], retries=src["retries"],
-                     headers=hdrs)
+    text, err = cached_http(url, timeout=src["timeout"], retries=src["retries"],
+                            headers=hdrs, max_age=src.get("cache_ttl", 0))
     if err:
         return [], f"ERR: {src['name']}: {err}", True
     try:
@@ -1692,9 +2225,13 @@ def research(query, lanes=None, limit=5, workers=8, on_progress=None):
             "cwe": q.cwes,
             "domain": q.domain,
             "url": q.is_url,
-            "ip": q.ipv4,
+            "ip": q.ip,
             "asn": q.asn,
             "hash": q.hash,
+            "ghsa": q.ghsas,
+            "lei": q.lei,
+            "repository": q.repo,
+            "package": q.package,
             "doi": q.doi,
             "arxiv": q.arxiv,
             "nct": q.nct,
