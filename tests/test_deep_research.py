@@ -157,6 +157,71 @@ class AutoRoutingTests(unittest.TestCase):
 
         self.assertEqual(route["selected_lanes"], ["web", "reference"])
 
+    def test_jev_security_on_prose_is_dropped_not_queried(self):
+        """A semantic security hit cannot answer a prose query.
+
+        All 18 security sources key on an exact identifier, so a prose query
+        leaves most of them inapplicable while the rest keyword-match the
+        prose and return CVE/proxy-exploit noise. Jev scored such a query
+        security=0.98, which must not be read as "this lane will contribute".
+        """
+        body = self.jev_response(security=0.98, news=0.73, academic=0.60)
+        with mock.patch.object(deep_research, "http", return_value=(body, None)):
+            route = deep_research.auto_route(
+                "cybersecurity incidents involving residential proxy networks botnets",
+                api_key="test-key", cost_aware=True,
+            )
+
+        self.assertEqual(route["mode"], "auto-jev")
+        self.assertNotIn("security", route["selected_lanes"])
+        self.assertIn("security", route["dropped_lanes"])
+        self.assertIn("exact identifier", route["dropped_lanes"]["security"])
+
+    def test_security_lane_is_kept_without_the_opt_in_flag(self):
+        """The cost model is opt-in: default routing must be unchanged."""
+        body = self.jev_response(security=0.98)
+        with mock.patch.object(deep_research, "http", return_value=(body, None)):
+            route = deep_research.auto_route(
+                "cybersecurity incidents involving residential proxy networks botnets",
+                api_key="test-key",
+            )
+
+        self.assertIn("security", route["selected_lanes"])
+        self.assertEqual(route["dropped_lanes"], {})
+
+    def test_forced_security_lane_is_never_dropped(self):
+        """Hard rules outrank the cost model."""
+        route = deep_research.auto_route("CVE-2021-44228", api_key="test-key",
+                                         cost_aware=True)
+
+        self.assertIn("security", route["selected_lanes"])
+        route2 = deep_research.auto_route("example.com", api_key="test-key",
+                                          cost_aware=True)
+        self.assertIn("security", route2["selected_lanes"])
+        self.assertNotIn("security", route2.get("dropped_lanes") or {})
+
+    def test_plan_output_reports_dropped_lanes(self):
+        body = self.jev_response(security=0.95)
+        with mock.patch.object(deep_research, "http", return_value=(body, None)):
+            route = deep_research.auto_route(
+                "how have botnets evolved over the last decade", api_key="test-key",
+                cost_aware=True,
+            )
+
+        self.assertIn("dropped security:", deep_research.format_route(route))
+
+    def test_prose_naming_a_real_defect_keeps_security(self):
+        """NVD's keywordSearch genuinely answers this, so the lane must stay."""
+        body = self.jev_response(security=0.9)
+        with mock.patch.object(deep_research, "http", return_value=(body, None)):
+            route = deep_research.auto_route(
+                "Cisco ASA SSL VPN denial of service vulnerability", api_key="test-key",
+                cost_aware=True,
+            )
+
+        self.assertIn("security", route["selected_lanes"])
+        self.assertNotIn("security", route["dropped_lanes"])
+
 
 class ParserTests(unittest.TestCase):
     def test_github_advisory_and_deps_parsers(self):
@@ -423,6 +488,81 @@ class ReportingTests(unittest.TestCase):
     def test_github_code_search_is_skipped_without_a_token(self):
         with mock.patch.object(deep_research, "_dotenv_value", return_value=None):
             self.assertIsNone(deep_research._github_code_build(deep_research.Q("parser")))
+
+
+class LaneCostTests(unittest.TestCase):
+    def test_dbpedia_miss_yields_no_row(self):
+        """DBpedia answers {} for an unknown resource.
+
+        Emitting a row for that produced a phantom "0 linked-data resources"
+        finding in the reference lane whose title echoed the query string back,
+        so it read as relevant to every query it appeared on.
+        """
+        rows, note = deep_research._dbpedia_parse(
+            "{}", "https://dbpedia.org/data/x.json", deep_research.Q("some obscure phrase"), 5
+        )
+
+        self.assertEqual(rows, [])
+        self.assertIn("no DBpedia entity", note)
+
+    def test_dbpedia_hit_is_named_and_counted(self):
+        resource = "http://dbpedia.org/resource/Residential_proxy"
+        payload = json.dumps({resource: {
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#type": {},
+            "http://www.w3.org/2000/01/rdf-schema#label": {},
+            "http://dbpedia.org/ontology/abstract": {},
+        }})
+
+        rows, note = deep_research._dbpedia_parse(
+            payload, "https://dbpedia.org/data/Residential_proxy.json",
+            deep_research.Q("residential proxy"), 5,
+        )
+
+        self.assertIsNone(note)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][0], "Residential proxy")
+        self.assertIn("3 linked-data assertions", rows[0][1])
+
+    def test_dbpedia_page_link_only_payload_is_not_a_resource(self):
+        """A wikipedia.org key with only primaryTopic is not an entity page."""
+        payload = json.dumps({
+            "http://en.wikipedia.org/wiki/Some_Topic": {
+                "http://xmlns.com/foaf/0.1/primaryTopic": {},
+            },
+        })
+
+        rows, _ = deep_research._dbpedia_parse(
+            payload, "u", deep_research.Q("some topic"), 5
+        )
+
+        self.assertEqual(rows, [])
+
+    def test_exploitdb_needs_more_than_one_shared_word(self):
+        q = deep_research.Q(
+            "cybersecurity incidents involving residential proxy networks botnets"
+        )
+
+        # Matches only "proxy" -> the noise class this guard exists to stop.
+        self.assertFalse(deep_research._exploit_row_matches(
+            ["1", "", "Squid Web Proxy 2.2 - 'cachemgr.cgi' Unauthorized Connection"], q))
+        # Genuine multi-word match survives.
+        self.assertTrue(deep_research._exploit_row_matches(
+            ["2", "", "Squid Web Proxy 2.2 residential proxy botnet relay"], q))
+
+    def test_exploitdb_still_allows_single_word_queries(self):
+        q = deep_research.Q("proxy")
+
+        self.assertTrue(deep_research._exploit_row_matches(
+            ["1", "", "Squid Web Proxy 2.2 - Unauthorized Connection"], q))
+
+
+class CliFlagTests(unittest.TestCase):
+    def test_threshold_alias_resolves_to_auto_threshold(self):
+        """`--threshold` is the intuitive spelling and is now an exact alias."""
+        source = (ROOT / "scripts" / "deep_research.py").read_text()
+
+        self.assertIn('"--auto-threshold", "--threshold"', source)
+        self.assertIn("allow_abbrev=False", source)
 
 
 class RegistryTests(unittest.TestCase):

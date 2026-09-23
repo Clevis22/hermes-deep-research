@@ -86,6 +86,22 @@ failure or flat low-confidence distribution widens to a conservative local fallb
 `--auto --plan` to see the route and request count without querying research
 sources. `--deep` remains the explicit exhaustive mode.
 
+**A Jev lane score is semantic relevance, not expected yield.** All 18 security
+sources key on an exact identifier (CVE, GHSA, CWE, domain, repo, package), so a
+topic-word prose query can score `security=0.98` and still contribute nothing:
+12 of the 18 are skipped as not applicable, while NVD, CISA KEV and ExploitDB
+keyword-match the prose and return CVE and unrelated-exploit noise. Measured on
+`cybersecurity incidents involving residential proxy networks botnets`, the lane
+produced 18 rows and none on topic. Pass `--cost-aware` to drop a lane Jev
+selected on topic alone when its sources cannot answer the query shape; the drop
+is reported as `dropped <lane>: <reason>` in `--plan` and in the route JSON.
+It is opt-in because the same heuristic cannot separate a topic-word query from
+a legitimate detection-engineering one — `residential proxy detection research`
+really does belong in that lane — and hard identifier rules always outrank it,
+so a forced lane is never dropped. `--threshold` is an exact alias of
+`--auto-threshold`; the parser disables abbreviations, so an unknown flag is an
+error instead of being silently accepted as a prefix.
+
 **Every run ends with a numbered Sources block** (`[n]`-citeable) containing
 on-topic rows only.
 
@@ -149,7 +165,8 @@ Bluesky auth can be checked on its own with `python3 scripts/bsky_probe.py`.
 | `--auto` | deterministic exact-shape routing plus optional Jev lane scoring |
 | `--lanes a,b` | pick lanes |
 | `--plan` | print the selected route without querying research sources |
-| `--auto-threshold P` | Jev inclusion probability, 0–1 (default `0.70`) |
+| `--auto-threshold P` | Jev inclusion probability, 0–1 (default `0.70`); `--threshold` also works |
+| `--cost-aware` | with `--auto`, drop a lane selected on topic alone when its sources all key on an exact identifier (reported in `--plan`) |
 | `--limit N` | rows per source (default 5) |
 | `--read N` | pull full text of the top N URLs (needs a local extractor on :3002) |
 | `--md PATH` | write a markdown report incl. a Sources block |

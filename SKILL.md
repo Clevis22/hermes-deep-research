@@ -61,7 +61,8 @@ python3 "$S" --sources                                           # list the regi
 | `--auto` | exact-shape rules + optional Jev semantic lane routing |
 | `--lanes a,b` | pick lanes: `web academic code community news regulatory security osint reference archive patents` |
 | `--plan` | print the route without querying research sources |
-| `--auto-threshold P` | Jev lane probability threshold (default `0.70`) |
+| `--auto-threshold P` | Jev lane probability threshold (default `0.70`); `--threshold` is an exact alias |
+| `--cost-aware` | with `--auto`, drop a lane Jev chose on topic alone when its sources cannot answer the query shape (reported as `dropped <lane>` in `--plan`) |
 | `--limit N` | rows per source (default 5) |
 | `--read N` | also pull full text of the top N URLs via local PiExtract |
 | `--md PATH` | write a markdown report incl. a Sources block |
@@ -271,6 +272,55 @@ which is what removed the repeated Crossref/Google-Scholar pairs.
   assistant text in the reply. Writing it to a `--md` file only, or leaving it in the
   ledger, counts as *not* delivering it. Do this every time the research skill runs, even
   when the answer already has inline `[n]` citations.
+- **A Jev lane score is semantic relevance, NOT expected yield.** Measured on
+  `cybersecurity incidents involving residential proxy networks botnets`, Jev
+  scored `security=0.98` — and the security lane returned **zero on-topic
+  findings**. All 18 sources there key on an exact identifier (CVE, GHSA, CWE,
+  domain, repo, package): 12 are skipped as *not applicable* on prose, while
+  NVD, CISA KEV and ExploitDB keyword-match the prose and emit CVE and
+  unrelated-exploit noise. Before treating a lane as valuable, check whether its
+  sources can *answer the query shape*; a high probability cannot tell you that.
+  `--cost-aware` drops the lane in that case and reports
+  `dropped security: <reason>` in `--plan` and in the route JSON.
+- **`--cost-aware` is opt-in on purpose — do not make it the default.** The same
+  heuristic cannot separate a topic-word query from a legitimate
+  detection-engineering one: `residential proxy detection research` really does
+  belong in the security lane (SigmaHQ, vendor advisories). Turning the drop on
+  by default broke the upstream calibration test for exactly that query. Hard
+  identifier rules always outrank the cost model, so a forced lane (bare `CVE-`,
+  domain, repo, package) is never dropped.
+- **Jev's marginal lane value decays sharply — measure it, don't trust the
+  score.** On the same query, adding lanes to `web`: `news` added 7 on-topic
+  findings for +0s (3.9s vs 4.0s); `security` then added **1 finding for +22s**
+  (26.1s vs 3.9s) — and that one was noise. Jev scored both highly
+  (`news=0.73`, `security=0.98`). The cost is not the inapplicable sources (they
+  skip in ~0s); it is the three that keyword-match prose — ExploitDB ~7s,
+  NVD ~4s, CISA KEV ~2s.
+- **ExploitDB matched on a single shared word and returned pure noise.** Its
+  adapter accepted a row when *any one* query word appeared in the title, so
+  "proxy" pulled in Proxy Anket, Squid Web Proxy and IPFire proxy.cgi:
+  measured 270 rows from 47k, every one off-topic. `_exploit_row_matches` now
+  requires 2 words for a multi-word query (mirroring `relevant()`), which
+  returned 0 spurious rows. A single-word query is still allowed through.
+- **DBpedia emitted a finding for every query it was given.** A miss returns
+  `{}` and the old adapter still produced a "0 linked-data resources" line whose
+  title echoed the query string back, so it scored as relevant to everything it
+  appeared on. `_dbpedia_parse` now returns real entity pages only (predicates
+  beyond `primaryTopic`/`wikiPageWikiLink`) under the resource's own name.
+- **The 101-source registry is mostly redundancy on real queries.** Measured on
+  the residential-proxy incident `--deep` run: only **11 of 101 sources**
+  produced any on-topic row, and **80% of all attributions came from 4 SearXNG
+  categories** (`news` 21, `web` 19, `science` 18, `general` 14 of 90). The long
+  tail of direct registry APIs (Crossref 5, Zenodo 3, OpenReview 2, OpenAlex 1)
+  largely re-found what SearXNG already had. SearXNG is load-bearing: if lanes
+  go quiet, check those backends first, and read a `--deep` run's
+  source-attribution tail before claiming broad coverage.
+- **`--threshold` is an exact alias, and abbreviations are now disabled.**
+  Previously argparse prefix matching silently accepted `--threshold 0.60` (and
+  a typo like `--thresold`) as an abbreviation of `--auto-threshold`, so a
+  mistyped flag looked honoured while the route never changed. The parser now
+  sets `allow_abbrev=False`, so an unknown flag is an error. Always read the
+  `route:` line back rather than assuming a flag applied.
 - **`--deep` on every question is waste.** A simple lookup should use `--auto`,
   `--quick`, or plain web search. Reserve `--deep` for a genuinely exhaustive
   sweep.

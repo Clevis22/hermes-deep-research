@@ -500,6 +500,46 @@ def fallback_route_lanes(q):
     return forced | matched, reasons
 
 
+# Terms that the identifier-keyed security sources can genuinely act on: NVD's
+# keywordSearch really does answer "Apache Struts RCE vulnerability". Generic
+# topic words (botnet, proxy, attack, malware) are deliberately ABSENT — they
+# describe a subject, not a query an advisory database can match.
+ACTIONABLE_SECURITY_TERMS = (
+    "vulnerability", "vulnerabilities", "vuln", "exploit", "exploited",
+    "zero-day", "zero day", "zeroday", "patch", "patched", "advisory",
+    "cvss", "rce", "remote code execution", "privilege escalation",
+    "sql injection", "xss", "csrf", "deserialization", "bug bounty",
+)
+
+
+def _shape_only_reason(lane, q):
+    """Explain why a Jev-only ``security`` selection would waste a sweep.
+
+    Every source in the security lane keys on an exact identifier (CVE, GHSA,
+    CWE, domain, repo or package). Jev scores the lane on *topic* — it returned
+    security=0.98 for "cybersecurity incidents involving residential proxy
+    networks botnets" — but that prose leaves 12 of 18 sources inapplicable
+    while NVD, CISA KEV and ExploitDB keyword-match it and return CVE/proxy
+    noise. Measured on that query the lane contributed 18 rows, none on topic.
+
+    Dropping is deliberately narrow. A prose query naming a real defect
+    ("Cisco ASA SSL VPN denial of service vulnerability") IS answerable by
+    keyword search, so an actionable vulnerability term keeps the lane. Only a
+    topic-word query with no defect to look up is dropped, and only when the
+    hard rules did not already force the lane.
+    """
+    if lane != "security":
+        return None
+    if (q.cves or q.ghsas or q.cwes or q.domain or q.ip or q.asn or q.hash
+            or q.repo or q.package or q.lei):
+        return None
+    low = q.raw.lower()
+    if any(term in low for term in ACTIONABLE_SECURITY_TERMS):
+        return None
+    return ("dropped: security sources key on an exact identifier or a named "
+            "vulnerability; topic words alone yield keyword noise")
+
+
 def jev_lane_scores(q, api_key=None):
     """Return (probabilities, metadata, error) from OpenRouter Jev."""
     if api_key is None:
@@ -558,7 +598,7 @@ def jev_lane_scores(q, api_key=None):
     }, None
 
 
-def auto_route(query, threshold=AUTO_THRESHOLD, api_key=None):
+def auto_route(query, threshold=AUTO_THRESHOLD, api_key=None, cost_aware=False):
     """Choose lanes with hard identifier rules plus Jev's soft judgments."""
     q = query if isinstance(query, Q) else Q(query)
     forced, reasons = hard_route_lanes(q)
@@ -575,6 +615,7 @@ def auto_route(query, threshold=AUTO_THRESHOLD, api_key=None):
             "note": "exact identifier routed locally; Jev was not called",
             "model": None,
             "usage": {},
+            "dropped_lanes": {},
         }
     scores, meta, err = jev_lane_scores(q, api_key=api_key)
     fallback = scores is None
@@ -585,10 +626,21 @@ def auto_route(query, threshold=AUTO_THRESHOLD, api_key=None):
         reasons.update(fallback_reasons)
         mode = "auto-rules-fallback"
         scores = {}
+        dropped = {}
     else:
         selected = set(forced)
+        dropped = {}
         for lane, probability in scores.items():
             if probability >= threshold:
+                # A high score on a lane whose sources cannot answer this query
+                # shape is a false positive, not a finding. Only lanes the hard
+                # rules did NOT force can be dropped this way, and only under
+                # the opt-in --cost-aware flag (see _shape_only_reason for why
+                # this is not the default).
+                reason = _shape_only_reason(lane, q) if cost_aware and lane not in forced else None
+                if reason:
+                    dropped[lane] = reason
+                    continue
                 selected.add(lane)
                 reasons.setdefault(lane, f"Jev probability {probability:.2f}")
 
@@ -598,7 +650,9 @@ def auto_route(query, threshold=AUTO_THRESHOLD, api_key=None):
         if forced == {"web"}:
             plausibility_floor = min(threshold, 0.35)
             for lane, probability in sorted(scores.items(), key=lambda item: item[1], reverse=True)[:2]:
-                if probability >= plausibility_floor:
+                if probability >= plausibility_floor and lane not in dropped:
+                    if cost_aware and _shape_only_reason(lane, q):
+                        continue
                     selected.add(lane)
                     reasons.setdefault(lane, f"top Jev probability {probability:.2f}")
 
@@ -624,6 +678,7 @@ def auto_route(query, threshold=AUTO_THRESHOLD, api_key=None):
         "note": note,
         "model": meta.get("model"),
         "usage": meta.get("usage", {}),
+        "dropped_lanes": dropped,
     }
 
 
@@ -637,6 +692,8 @@ def format_route(route):
         text.append("Jev: " + ", ".join(f"{lane}={value:.2f}" for lane, value in ranked))
     if route.get("note"):
         text.append(f"note: {route['note']}")
+    for lane, reason in (route.get("dropped_lanes") or {}).items():
+        text.append(f"dropped {lane}: {reason}")
     return "\n".join(text)
 
 
@@ -1559,6 +1616,23 @@ def _openphish_parse(text, _url, q, limit):
 
 register("OpenPhish feed", "security", _openphish_build, "text", _openphish_parse)
 
+def _exploit_row_matches(row, q):
+    """Require more than one query word to match an exploit title.
+
+    One shared word is not evidence: "proxy" appears in unrelated exploits
+    (Proxy Anket, Squid Web Proxy, IPFire proxy.cgi). Measured on a prose
+    security query, a 1-word match returned 270 rows from 47k and every one of
+    them was noise; requiring 2 returned 0 spurious rows while keeping genuine
+    multi-word hits. This mirrors ``relevant()``'s n>=3 -> 2-word rule.
+    """
+    if not q.words:
+        return False
+    title = (row[2] or "").lower()
+    terms = [w.lower() for w in q.words]
+    need = 1 if len(terms) <= 2 else 2
+    return sum(1 for w in terms if w in title) >= min(need, len(terms))
+
+
 register("ExploitDB", "security",
          lambda q: ("https://gitlab.com/exploit-database/exploitdb/-/raw/main/files_exploits.csv"
                     if not (q.package or q.repo) else None),
@@ -1566,8 +1640,7 @@ register("ExploitDB", "security",
                                        clip(f"{r[5]}/{r[6]} {r[3]}", 60),
                                        f"https://www.exploit-db.com/exploits/{r[0]}")
                                       for r in _csv_rows(t)
-                                      if len(r) > 6 and q.words
-                                      and any(w.lower() in (r[2] or "").lower() for w in q.words)][:l],
+                                      if len(r) > 6 and _exploit_row_matches(r, q)][:l],
                                      None))
 
 # Vendor / distro advisory feeds. These are the tier the security lane lacked:
@@ -1966,11 +2039,36 @@ register("Internet Archive", "reference",
                               for d in (dig(jload(t), "response.docs", []) or [])[:l]], None),
          timeout=30)
 
+def _dbpedia_parse(text, url, q, limit):
+    """Return real linked-data resources only.
+
+    A miss is not an error: DBpedia answers ``{}`` for a resource it has no
+    page for, and emitting a row for that turned every free-text query into a
+    phantom "0 linked-data resources" finding in the ``reference`` lane. That
+    row carried no evidence and, because it echoed the query string back as its
+    title, it scored as highly relevant to every query it appeared on.
+    """
+    payload = jload(text) or {}
+    rows = []
+    for resource, assertions in payload.items():
+        if not isinstance(assertions, dict):
+            continue
+        # Entity pages carry triples under the dbpedia.org/resource/<Name> key;
+        # the wikipedia.org key only marks the primary topic of a page.
+        predicates = sum(1 for pred in assertions
+                         if pred.rsplit("/", 1)[-1] not in ("primaryTopic", "wikiPageWikiLink"))
+        if predicates <= 0:
+            continue
+        name = urllib.parse.unquote(resource.rstrip("/").rsplit("/", 1)[-1]).replace("_", " ")
+        rows.append((clip(name, 90), f"{predicates} linked-data assertions", resource))
+    if not rows:
+        return [], "no DBpedia entity matched this phrase"
+    return rows[:limit], None
+
+
 register("DBpedia", "reference",
          lambda q: "https://dbpedia.org/data/" + urllib.parse.quote(q.raw.replace(" ", "_")) + ".json",
-         "json",
-         lambda t, u, q, l: ([(f"DBpedia resource for {clip(q.raw, 60)}",
-                               f"{len(jload(t) or {})} linked-data resources", u)], None))
+         "json", _dbpedia_parse)
 
 register("Datamuse", "reference",
          lambda q: f"https://api.datamuse.com/words?ml={q.enc}&max=6",
@@ -2736,7 +2834,12 @@ def markdown_report(res, include_sources=True):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Deep research across all keyless sources")
+    # allow_abbrev=False: argparse otherwise silently accepts any unambiguous
+    # prefix as a flag, so a typo like `--threshold 0.60` was parsed as
+    # `--auto-threshold` and appeared to work. `--threshold` is now an explicit
+    # alias so the intuitive spelling resolves to the documented behaviour.
+    ap = argparse.ArgumentParser(description="Deep research across all keyless sources",
+                                 allow_abbrev=False)
     ap.add_argument("query", nargs="?")
     ap.add_argument("--deep", action="store_true", help="all lanes (default)")
     ap.add_argument("--quick", action="store_true", help="web+academic+community+news+reference")
@@ -2745,8 +2848,13 @@ def main():
     ap.add_argument("--lanes", help="comma-separated: " + ",".join(LANES))
     ap.add_argument("--plan", action="store_true",
                     help="print the routing plan without querying research sources")
-    ap.add_argument("--auto-threshold", type=float, default=AUTO_THRESHOLD, metavar="P",
+    ap.add_argument("--auto-threshold", "--threshold", dest="auto_threshold",
+                    type=float, default=AUTO_THRESHOLD, metavar="P",
                     help=f"Jev lane probability threshold (default {AUTO_THRESHOLD})")
+    ap.add_argument("--cost-aware", dest="cost_aware", action="store_true",
+                    help="with --auto, drop a lane Jev selected only on topic when its "
+                         "sources all key on an exact identifier (currently the security "
+                         "lane on topic-word prose); reported as 'dropped <lane>' in --plan")
     ap.add_argument("--limit", type=int, default=5, help="rows per source (default 5)")
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--read", type=int, default=0, metavar="N",
@@ -2817,7 +2925,8 @@ def main():
         return 2
 
     if args.auto:
-        routing = auto_route(args.query, threshold=args.auto_threshold)
+        routing = auto_route(args.query, threshold=args.auto_threshold,
+                             cost_aware=args.cost_aware)
         lanes = tuple(routing["selected_lanes"])
     elif args.quick:
         lanes = QUICK_LANES
